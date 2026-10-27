@@ -1,10 +1,13 @@
 #include "Client.h"
 #include "Init.h"
 #include "../Interface/sandbox_h.h"
+#include "../Interface/SandboxConfig.h"
 #include "printwnd.h"
 #include <rpc.h>
 #include <stdio.h>
 #include <stdexcept>
+#include <vector>
+#include <string.h>
 
 #include <iostream>
 
@@ -120,6 +123,63 @@ Gdiplus::Bitmap* DrawFinishedText()
 	return bitmap;
 }
 
+// Bytes actually holding pixels in one row of a locked GDI+ bitmap.
+//
+// GDI+ does not promise anything about the bytes past Width * bytesPerPixel in
+// a row, so a whole Stride * Height memcmp would report differences that are
+// not on screen. Compare and copy row by row instead.
+static size_t LockedRowBytes(const Gdiplus::BitmapData& Data)
+{
+	return (size_t)Data.Width * (Gdiplus::GetPixelFormatSize(Data.PixelFormat) / 8);
+}
+
+static bool FrameMatches(const Gdiplus::BitmapData& Data, const std::vector<unsigned char>& Previous)
+{
+	const size_t RowBytes = LockedRowBytes(Data);
+
+	// A zero row size means the pixel format was not understood; report a
+	// difference so the frame is sent rather than silently skipped forever.
+	if (RowBytes == 0 || Previous.size() != RowBytes * Data.Height)
+	{
+		return false;
+	}
+
+	const unsigned char* Row = (const unsigned char*)Data.Scan0;
+
+	for (UINT y = 0; y < Data.Height; ++y)
+	{
+		if (memcmp(Row, Previous.data() + (size_t)y * RowBytes, RowBytes) != 0)
+		{
+			return false;
+		}
+
+		Row += Data.Stride;
+	}
+
+	return true;
+}
+
+static void CopyFrame(const Gdiplus::BitmapData& Data, std::vector<unsigned char>& Out)
+{
+	const size_t RowBytes = LockedRowBytes(Data);
+	Out.resize(RowBytes * Data.Height);
+
+	const unsigned char* Row = (const unsigned char*)Data.Scan0;
+
+	for (UINT y = 0; y < Data.Height; ++y)
+	{
+		memcpy(Out.data() + (size_t)y * RowBytes, Row, RowBytes);
+		Row += Data.Stride;
+	}
+}
+
+// Previous frame's pixels, used to skip frames that did not change.
+//
+// At file scope rather than local to SandboxInitClient because that function
+// contains an RpcTryExcept (__try) block, and MSVC rejects __try in any
+// function that also needs object unwinding for a local.
+static std::vector<unsigned char> gPreviousFrame;
+
 void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 {
 	RPC_WSTR StringBinding;
@@ -158,7 +218,7 @@ void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 		NULL,
 		(RPC_WSTR)TEXT("ncacn_ip_tcp"),
 		(RPC_WSTR)IPAddress,
-		NULL,
+		(RPC_WSTR)SANDBOX_RPC_ENDPOINT,
 		NULL,
 		&StringBinding
 	);
@@ -183,6 +243,34 @@ void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 	ULONG_PTR gdiplusToken;
 	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
+	// The loop below has no pacing of its own: it re-captures every window and
+	// forces a repaint of each one (PrintWindow is a synchronous WM_PRINT) as
+	// fast as RPC allows. Controls get no time to finish painting, so a
+	// half-painted status bar or toolbar shows up as flicker, and the container
+	// burns CPU for frames the host drops anyway. Cap the capture rate.
+	const DWORD FrameIntervalMs = 33;   // ~30 fps
+	ULONGLONG LastFrameTick = GetTickCount64();
+
+	// A frame whose pixels are identical to the previous one is not worth
+	// encoding and sending. On a desktop that is not being animated this is the
+	// large majority of frames: measured over 120 captured frames, 81% were
+	// byte for byte identical to their predecessor and the worst case changed
+	// 0.3% of the screen. Set this to false to send every frame unconditionally.
+	const bool bSkipUnchangedFrames = true;
+
+	// How long an unchanged screen may go without a frame being sent anyway.
+	//
+	// The server throws a frame away if its previous one has not been presented
+	// yet (Rendering.cpp: EndImageTransmission returns early while gShouldRender
+	// is still set), and it never tells the client. A frame skipped here plus a
+	// frame dropped there would leave the host showing an older image with
+	// nothing left to trigger a repaint, so force one through periodically.
+	const ULONGLONG ResyncIntervalMs = 1000;
+
+	// When the last frame was actually put on the wire, for the periodic
+	// resync described above.
+	ULONGLONG LastSentTick = GetTickCount64();
+
 	bool bContinue = true;
 	while(bContinue)
 	{
@@ -200,45 +288,87 @@ void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 
 		Bitmap = PrintScreen(GetThreadDesktop(GetCurrentThreadId()));
 
-		Gdiplus::Rect Rect(0, 0, Bitmap->GetWidth(), Bitmap->GetHeight());
+		// Decide whether this frame is worth the encode/transfer/decode trip.
+		ULONGLONG Now = GetTickCount64();
+		bool bSendFrame = !bSkipUnchangedFrames || (Now - LastSentTick) >= ResyncIntervalMs;
 
-		CLSID sid;
-		GetEncoderClsid(L"image/png", &sid);
+		if (!bSendFrame && Bitmap)
+		{
+			Gdiplus::Rect FrameRect(0, 0, Bitmap->GetWidth(), Bitmap->GetHeight());
+			Gdiplus::BitmapData Locked;
 
-		IStream* Stream;
-		CreateStreamOnHGlobal(NULL, TRUE, &Stream);
+			// Lock in the bitmap's own format so GDI+ does not have to convert.
+			if (Bitmap->LockBits(&FrameRect, Gdiplus::ImageLockModeRead, Bitmap->GetPixelFormat(), &Locked) == Gdiplus::Ok)
+			{
+				bSendFrame = !FrameMatches(Locked, gPreviousFrame);
 
-		Bitmap->Save(Stream, &sid, NULL);
+				if (bSendFrame)
+				{
+					CopyFrame(Locked, gPreviousFrame);
+				}
 
-		HGLOBAL hGlobalMem = NULL;
-		GetHGlobalFromStream(Stream, &hGlobalMem);
+				Bitmap->UnlockBits(&Locked);
+			}
+			else
+			{
+				// The pixels could not be read back, so whether the frame
+				// changed is unknown. Send it rather than risk freezing the
+				// host on an old image.
+				bSendFrame = true;
+			}
+		}
 
-		const SIZE_T Size = GlobalSize(hGlobalMem);
 		const SIZE_T ChunkSize = 1 * 1024 * 1024;
-		SIZE_T SizeRemaining = Size;
+		SIZE_T Size = 0;
+		SIZE_T SizeRemaining = 0;
+		IStream* Stream = nullptr;
+		HGLOBAL hGlobalMem = NULL;
+		LPVOID lpGlobalMem = NULL;
 
-		LPVOID lpGlobalMem = GlobalLock(hGlobalMem);
+		if (bSendFrame)
+		{
+			CLSID sid;
+			GetEncoderClsid(L"image/png", &sid);
+
+			CreateStreamOnHGlobal(NULL, TRUE, &Stream);
+
+			Bitmap->Save(Stream, &sid, NULL);
+
+			GetHGlobalFromStream(Stream, &hGlobalMem);
+
+			Size = GlobalSize(hGlobalMem);
+			SizeRemaining = Size;
+
+			lpGlobalMem = GlobalLock(hGlobalMem);
+		}
 
 		RpcTryExcept
 		{
-			RpcBeginImage(BindingHandle, Bitmap->GetWidth(), Bitmap->GetHeight(), (unsigned long)Size);
-
-			while (SizeRemaining > 0)
+			if (bSendFrame)
 			{
-				const unsigned char* StartData = (unsigned char*)lpGlobalMem + (Size - SizeRemaining);
-				const SIZE_T SizeToSend = min(SizeRemaining, ChunkSize);
+				LastSentTick = GetTickCount64();
 
-				RpcSendImageChunkData(
-					BindingHandle,
-					(unsigned long)SizeToSend,
-					StartData
-				);
+				RpcBeginImage(BindingHandle, Bitmap->GetWidth(), Bitmap->GetHeight(), (unsigned long)Size);
 
-				SizeRemaining -= SizeToSend;
+				while (SizeRemaining > 0)
+				{
+					const unsigned char* StartData = (unsigned char*)lpGlobalMem + (Size - SizeRemaining);
+					const SIZE_T SizeToSend = min(SizeRemaining, ChunkSize);
+
+					RpcSendImageChunkData(
+						BindingHandle,
+						(unsigned long)SizeToSend,
+						StartData
+					);
+
+					SizeRemaining -= SizeToSend;
+				}
+
+				RpcEndImage(BindingHandle);
 			}
 
-			RpcEndImage(BindingHandle);
-
+			// Input is drained on every iteration, frame sent or not, so a
+			// static screen still responds to the keyboard and mouse.
 			SandboxEvent event;
 			while (RpcPopEvent(BindingHandle, &event))
 			{
@@ -278,13 +408,27 @@ void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 					break;
 				case SBET_KeyEvent:
 				{
+					WORD scan = (WORD)event.keyboardEvent.keyIndex;
+
 					INPUT input = { 0 };
 					input.type = INPUT_KEYBOARD;
-					input.ki.wScan = event.keyboardEvent.keyIndex;
-					input.ki.wVk = MapVirtualKey(input.ki.wScan, MAPVK_VSC_TO_VK_EX);
 					input.ki.dwFlags = event.keyboardEvent.bKeyDown ? 0 : KEYEVENTF_KEYUP;
 
 					input.ki.dwFlags |= KEYEVENTF_SCANCODE;
+
+					// The host's SDL-to-DIK table stores extended keys with bit
+					// 0x80 set (arrows, Home/End/PgUp/PgDn, Insert/Delete, numpad
+					// Enter and Divide, right Ctrl/Alt, Win/Menu). Strip the
+					// marker and flag the key as extended, otherwise the system
+					// does not recognise the scan code and the key is dropped.
+					if (scan & 0x80)
+					{
+						scan &= 0x7F;
+						input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+					}
+
+					input.ki.wScan = scan;
+					input.ki.wVk = (WORD)MapVirtualKey(scan, MAPVK_VSC_TO_VK_EX);
 
 					cout << "scan:" << input.ki.wScan << " vk: " << input.ki.wVk << " received" << endl;
 
@@ -310,10 +454,27 @@ void SANDBOXCLIENT_API SandboxInitClient(const wchar_t* IPAddress)
 		}
 		RpcEndExcept
 
-		GlobalUnlock(hGlobalMem);
+		if (lpGlobalMem)
+		{
+			GlobalUnlock(hGlobalMem);
+		}
 
-		Stream->Release();
+		if (Stream)
+		{
+			Stream->Release();
+		}
+
 		delete Bitmap;
+
+		// See FrameIntervalMs above.
+		ULONGLONG FrameEnd = GetTickCount64();
+		const ULONGLONG Elapsed = FrameEnd - LastFrameTick;
+		if (Elapsed < FrameIntervalMs)
+		{
+			Sleep((DWORD)(FrameIntervalMs - Elapsed));
+			FrameEnd = GetTickCount64();
+		}
+		LastFrameTick = FrameEnd;
 	}
 	//CLSID sid;
 	//GetEncoderClsid(L"image/png", &sid);

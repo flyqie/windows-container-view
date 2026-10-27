@@ -501,6 +501,14 @@ void InitVideo()
 		SDL_WINDOW_RESIZABLE | SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS
 	);
 
+	// Keep the host's input method out of the remote session. An active IME
+	// (e.g. a Chinese input method) swallows exactly the character-producing
+	// keys into its composition buffer and passes control keys through, so
+	// letters and digits never arrive here as SDL_KEYDOWN while Enter,
+	// Backspace and the arrow keys still do. Detaching the IME from this
+	// window makes every physical key reach us as a plain scan code.
+	SDL_StopTextInput();
+
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 	SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
 

@@ -1,3 +1,10 @@
 /Output
 /Binaries
 /.vs
+
+# Extracted container image used for reverse engineering
+/servercore20h2
+/servercore20h2.tar
+
+# Per-user Visual Studio settings
+*.vcxproj.user

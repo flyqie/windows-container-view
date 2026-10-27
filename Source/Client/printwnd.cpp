@@ -8,6 +8,8 @@
 
 #include <iostream>
 
+#include "printwnd.h"
+
 using namespace std;
 
 HWND hDesktopWnd = NULL;
@@ -132,6 +134,49 @@ typedef struct {
 
 HBITMAP ghTempBitmap = NULL;
 
+// Re-prints every descendant of hwnd into hdc.
+//
+// PrintWindow reaches children through the parent's PRF_CHILDREN pass, and that
+// pass does not reliably draw every themed common control: a status bar comes
+// out with its background painted but its parts missing, on a random subset of
+// frames. Printing each descendant again on top fixes it. The container has no
+// DWM, so WM_PRINT is the only way to get pixels at all; there is no screen
+// surface to read instead.
+//
+// GetWindow(GW_CHILD)/GW_HWNDNEXT walks from the topmost child down, so the
+// children are iterated in reverse to paint the bottom-most first and leave the
+// topmost painted last. OriginX/OriginY are the screen coordinates of hdc's
+// origin, needed to place each child inside the DC.
+static void PrintWindowTree(HWND hwnd, HDC hdc, int OriginX, int OriginY)
+{
+	std::vector<HWND> Children;
+
+	for (HWND hChild = GetWindow(hwnd, GW_CHILD); hChild; hChild = GetWindow(hChild, GW_HWNDNEXT))
+	{
+		Children.push_back(hChild);
+	}
+
+	for (std::vector<HWND>::reverse_iterator it = Children.rbegin(); it != Children.rend(); ++it)
+	{
+		if (!IsWindowVisible(*it))
+		{
+			continue;
+		}
+
+		RECT r;
+		GetWindowRect(*it, &r);
+
+		POINT OldOrigin;
+		SetViewportOrgEx(hdc, r.left - OriginX, r.top - OriginY, &OldOrigin);
+
+		PrintWindow(*it, hdc, 0);
+
+		PrintWindowTree(*it, hdc, OriginX, OriginY);
+
+		SetViewportOrgEx(hdc, OldOrigin.x, OldOrigin.y, NULL);
+	}
+}
+
 BOOL CALLBACK EnumWindowsProc(
 	_In_ HWND   hwnd,
 	_In_ LPARAM lParam
@@ -142,28 +187,48 @@ BOOL CALLBACK EnumWindowsProc(
 
 	GetWindowInfo(hwnd, &WindowInfo);
 
-	if ((WindowInfo.dwStyle & WS_VISIBLE))
+	if (!(WindowInfo.dwStyle & WS_VISIBLE) || IsIconic(hwnd))
 	{
-		RECT r;
-		GetWindowRect(hwnd, &r);
-		int x = r.left;
-		int y = r.top;
-		int w = r.right - r.left;
-		int h = r.bottom - r.top;
-
-		HDC hdcWindow = GetDCEx(hwnd, NULL, DCX_CACHE | DCX_WINDOW);
-		HDC hdcWindowMemory = CreateCompatibleDC(hdcWindow);
-
-		SelectObject(hdcWindowMemory, ghTempBitmap);
-
-		// Write visuals into the DC
-		PrintWindow(hwnd, hdcWindowMemory, 0);
-
-		BitBlt(Param->hdcMemory, x, y, w, h, hdcWindowMemory, 0, 0, SRCCOPY | CAPTUREBLT);
-
-		DeleteDC(hdcWindowMemory);
-		ReleaseDC(hwnd, hdcWindow);
+		return TRUE;
 	}
+
+	RECT r;
+	GetWindowRect(hwnd, &r);
+	int x = r.left;
+	int y = r.top;
+	int w = r.right - r.left;
+	int h = r.bottom - r.top;
+
+	if (w <= 0 || h <= 0)
+	{
+		return TRUE;
+	}
+
+	// Capture through PrintWindow, then re-print the descendants.
+	//
+	// BitBlt from the window's own DC is not an option: this container has no
+	// DWM, so there is no composited screen surface to read and the result is
+	// unusable. WM_PRINT is the only way to obtain pixels, and its child pass
+	// is the part that needs the extra pass below.
+	HDC hdcWindow = GetDCEx(hwnd, NULL, DCX_CACHE | DCX_WINDOW);
+	HDC hdcWindowMemory = CreateCompatibleDC(hdcWindow);
+
+	SelectObject(hdcWindowMemory, ghTempBitmap);
+
+	// ghTempBitmap is one scratch bitmap shared by every window and every
+	// frame, and no capture pass is obliged to paint all of it. Fill with the
+	// desktop colour first so anything left unpainted blends into the
+	// background instead of showing the previously captured window's pixels.
+	RECT Scratch{ 0, 0, w, h };
+	FillRect(hdcWindowMemory, &Scratch, GetSysColorBrush(COLOR_DESKTOP));
+
+	PrintWindow(hwnd, hdcWindowMemory, 0);
+	PrintWindowTree(hwnd, hdcWindowMemory, x, y);
+
+	BitBlt(Param->hdcMemory, x, y, w, h, hdcWindowMemory, 0, 0, SRCCOPY);
+
+	DeleteDC(hdcWindowMemory);
+	ReleaseDC(hwnd, hdcWindow);
 
 	return TRUE;
 }
