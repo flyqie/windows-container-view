@@ -23,3 +23,11 @@ const wchar_t* SandboxHost();
 // that advertises a fixed set of 18 modes. A value outside that set is rejected
 // and logged; see Docs/IMAGE-ANALYSIS.md.
 bool SandboxResolution(int& Width, int& Height);
+
+// Whether the client draws its dock below the desktop. SANDBOX_DOCK; off unless
+// it is set. See Source/Client/Dock.h.
+bool SandboxDock();
+
+// A boolean environment variable: "1", "y" or "t" in either case is true, and
+// anything else -- including unset -- is false.
+bool SandboxFlag(const char* Name);

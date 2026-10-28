@@ -212,6 +212,41 @@ bool SetDisplayMode(int Width, int Height)
 	return true;
 }
 
+bool ReserveScreenBottom(int Rows)
+{
+	RECT Area = { 0 };
+	Area.right = GetSystemMetrics(SM_CXSCREEN);
+	Area.bottom = GetSystemMetrics(SM_CYSCREEN) - Rows;
+
+	// No SPIF_SENDCHANGE: this runs before the program is started, so there is
+	// nothing yet that has cached the old work area, and the setting persists
+	// for whatever starts later.
+	if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &Area, 0))
+	{
+		Debug() << "Work area could not be reserved (err 0x" << hex << GetLastError() << ")" << endl;
+
+		return false;
+	}
+
+	// Read it back rather than trusting the return value. This is the one part
+	// of the dock the container cannot show us, and a work area that quietly
+	// stayed full-screen would leave every maximized window behind it.
+	RECT Got = { 0 };
+
+	if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &Got, 0)
+		&& (Got.right != Area.right || Got.bottom != Area.bottom))
+	{
+		Debug() << "Work area stayed " << Got.right << "x" << Got.bottom
+		        << " rather than " << Area.right << "x" << Area.bottom << endl;
+
+		return false;
+	}
+
+	Debug() << "Work area reserved: bottom " << Rows << " rows" << endl;
+
+	return true;
+}
+
 void StartProgram(const wchar_t* Command)
 {
 	STARTUPINFO si;

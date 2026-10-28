@@ -1,4 +1,5 @@
 #include "Client.h"
+#include "Dock.h"
 #include "Init.h"
 #include "../Interface/sandbox_h.h"
 #include "../Common/SandboxEnv.h"
@@ -163,6 +164,16 @@ static std::vector<unsigned char> gPreviousFrame;
 // The container's cursor, read once per frame. File scope for the same reason.
 static CursorInfo gCursor;
 
+// Where the host's pointer last was, in frame coordinates, and whether that was
+// over the dock.
+//
+// The dock belongs to the client but the pointer belongs to the host, so this is
+// the only record of where it is. It is what lets the cursor keep following the
+// pointer over the dock without the host being told the dock exists.
+static int gPointerX = 0;
+static int gPointerY = 0;
+static bool gPointerInDock = false;
+
 // Frame profiler. Silent unless SANDBOX_DEBUG is set.
 //
 // capture / encode / send are tracked apart because they scale with different
@@ -190,6 +201,7 @@ struct FrameProfile
 	unsigned  TopPrintCalls;
 	unsigned  ChildPrintCalls;
 	ULONGLONG CursorTotal;
+	ULONGLONG DockTotal;
 	ULONGLONG GdiPlusTotal;
 
 	unsigned  Count;
@@ -310,6 +322,7 @@ static void ReportFrameProfile(DWORD FrameIntervalMs)
 	Debug() << "  capture split  us   alloc " << (gProfile.AllocTotal / N)
 	     << "  fills " << (gProfile.FillsTotal / N)
 	     << "  windows " << (gProfile.PassTotal / N)
+	     << "  dock " << (gProfile.DockTotal / N)
 	     << "  toGdi+ " << (gProfile.GdiPlusTotal / N) << endl;
 
 	Debug() << "  cursor read    us   " << (gProfile.CursorTotal / N) << endl;
@@ -381,6 +394,7 @@ static void ReportFrameProfile(DWORD FrameIntervalMs)
 	gProfile.TopPrintCalls = 0;
 	gProfile.ChildPrintCalls = 0;
 	gProfile.CursorTotal = 0;
+	gProfile.DockTotal = 0;
 	gProfile.GdiPlusTotal = 0;
 	gProfile.WindowStart = GetTickCount64();
 }
@@ -401,9 +415,65 @@ static const unsigned char gNoFrame = 0;
 // small; MSVC rejects __try in a function that also needs object unwinding.
 static void ApplyInputEvent(const SandboxEvent& event)
 {
+	// Whether the left button was pressed on the dock, so that the matching
+	// release is swallowed instead of being injected into the container.
+	static bool gDockPress = false;
+
 	switch (event.eventType)
 	{
 	case SBET_MouseEvent:
+	{
+		gPointerX = event.mouseEvent.x;
+		gPointerY = event.mouseEvent.y;
+
+		// Where the dock begins, which is the screen's height less the dock's.
+		// With the dock off it is the frame's own height, and a frame coordinate
+		// can never reach that, so the dock is simply never hit.
+		const int DockTop = GetLastDockTop();
+
+		gPointerInDock = event.mouseEvent.y >= DockTop;
+
+		// The dock is the client's own, not part of the container's desktop, so
+		// anything landing on it is handled here and never reaches the container.
+		// Motion included: SetCursorPos would otherwise drag the container's
+		// cursor down behind the dock.
+		if (gPointerInDock)
+		{
+			if (event.mouseEvent.buttonIndex == 1)
+			{
+				if (event.mouseEvent.bKeyDown)
+				{
+					gDockPress = true;
+
+					DockClick(
+						event.mouseEvent.x,
+						event.mouseEvent.y - DockTop,
+						GetLastFrameWidth());
+				}
+				else if (gDockPress)
+				{
+					gDockPress = false;
+				}
+				else
+				{
+					// Pressed on the desktop, released over the dock -- dragging
+					// a window past the bottom edge does this. The container is
+					// still holding the button down, so the release has to reach
+					// it or the drag never ends.
+					INPUT input = { 0 };
+					input.type = INPUT_MOUSE;
+					input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+					if (!SendInput(1, &input, sizeof(INPUT)))
+					{
+						Debug() << "SendInput for mouse returned false with error " << hex << GetLastError() << endl;
+					}
+				}
+			}
+
+			break;
+		}
+
 		// Position comes from SetCursorPos; the dx/dy below are ignored
 		// because MOUSEEVENTF_ABSOLUTE is not set.
 		SetCursorPos(event.mouseEvent.x, event.mouseEvent.y);
@@ -433,10 +503,18 @@ static void ApplyInputEvent(const SandboxEvent& event)
 				Debug() << "SendInput for mouse returned false with error " << hex << GetLastError() << endl;
 			}
 		}
+	}
 		break;
 
 	case SBET_WheelEvent:
 	{
+		// Nothing in the dock scrolls, and the container's cursor has no business
+		// behind it.
+		if (event.wheelEvent.y >= GetLastDockTop())
+		{
+			break;
+		}
+
 		// The system delivers the wheel to the window with keyboard focus, but
 		// the message carries the cursor position, so the cursor has to be where
 		// the user was pointing.
@@ -536,6 +614,21 @@ void SandboxInitClient(const wchar_t* Host, const wchar_t* Command)
 		{
 			SetDisplayMode(ModeWidth, ModeHeight);
 		}
+	}
+
+	// The dock covers the bottom of the desktop, so the desktop has to be told
+	// it ends above it. This is what a taskbar does with the space it occupies,
+	// and it is what makes a maximized window stop at the dock instead of
+	// disappearing behind it -- the container sees a smaller usable area, not a
+	// smaller screen.
+	//
+	// After the display mode, which resets the work area, and before the program
+	// starts, so the program is born with the right idea of how much room it has.
+	const int Dock = DockHeight();
+
+	if (Dock)
+	{
+		ReserveScreenBottom(Dock);
 	}
 
 	Debug() << "Starting " << (Command && *Command ? "the requested program" : "CMD") << "..." << endl;
@@ -739,15 +832,25 @@ void SandboxInitClient(const wchar_t* Host, const wchar_t* Command)
 				LastSentTick = GetTickCount64();
 			}
 
+			// Over the dock, the container's cursor is the wrong thing to report:
+			// it was never moved there, because a dock click never reaches the
+			// container. Reporting where the host's pointer actually is makes the
+			// host draw the cursor there instead, and it needs to know nothing
+			// about the dock to do that -- the position is in frame coordinates
+			// either way.
+			const long CursorX = gPointerInDock ? gPointerX : gCursor.X;
+			const long CursorY = gPointerInDock ? gPointerY : gCursor.Y;
+			const unsigned long CursorVisible = (gPointerInDock || gCursor.Visible) ? 1 : 0;
+
 			Status = RpcSendFrame(
 				BindingHandle,
 				FrameWidth,
 				FrameHeight,
 				Size,
 				FrameData,
-				gCursor.X,
-				gCursor.Y,
-				gCursor.Visible ? 1 : 0,
+				CursorX,
+				CursorY,
+				CursorVisible,
 				&EventCount,
 				Events
 			);
@@ -822,6 +925,7 @@ void SandboxInitClient(const wchar_t* Host, const wchar_t* Command)
 			gProfile.TopPrintCalls += B.TopLevelCalls;
 			gProfile.ChildPrintCalls += B.ChildCalls;
 			gProfile.CursorTotal += CursorUs;
+			gProfile.DockTotal += B.Dock;
 			gProfile.GdiPlusTotal += B.ToGdiPlus;
 
 			++gProfile.Count;

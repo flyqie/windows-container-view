@@ -53,6 +53,19 @@ const wchar_t* SandboxHost()
 	return Value.c_str();
 }
 
+bool SandboxFlag(const char* Name)
+{
+	char Value[8] = { 0 };
+
+	if (!GetEnvironmentVariableA(Name, Value, sizeof(Value)))
+	{
+		return false;
+	}
+
+	return Value[0] == '1' || Value[0] == 'y' || Value[0] == 'Y'
+		|| Value[0] == 't' || Value[0] == 'T';
+}
+
 bool SandboxResolution(int& Width, int& Height)
 {
 	static const std::wstring Value = Read(L"SANDBOX_RESOLUTION");
@@ -83,4 +96,13 @@ bool SandboxResolution(int& Width, int& Height)
 	Height = (int)H;
 
 	return true;
+}
+
+bool SandboxDock()
+{
+	// Read once. The environment cannot change under a running process, and this
+	// is asked for on every frame.
+	static const bool Enabled = SandboxFlag("SANDBOX_DOCK");
+
+	return Enabled;
 }

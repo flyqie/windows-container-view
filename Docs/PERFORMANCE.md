@@ -13,7 +13,7 @@ what is actually in the container image in [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md
 
 | Phase | Contents |
 |---|---|
-| `capture` | `PrintScreen()`: the full-screen bitmap, the desktop fill, `PrintWindow` over every window, the conversion to GDI+ |
+| `capture` | `PrintScreen()`: the full-screen bitmap, the desktop fill, `PrintWindow` over every window, the dock, the conversion to GDI+ |
 | `encode` | GDI+ encoding the whole screen as PNG |
 | `send` | The `RpcSendFrame` round trip (**including the server's decode and texture upload**; see section 5) |
 
@@ -24,7 +24,29 @@ what is actually in the container image in [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md
 | `alloc` | `CreateCompatibleBitmap` for the full-screen target |
 | `fills` | `FillRect` to the desktop colour |
 | `windows` | `EnumDesktopWindows` plus every `PrintWindow` and `BitBlt` |
+| `dock` | Drawing the strip of window buttons over the bottom of the desktop |
 | `toGdi+` | `Bitmap::FromHBITMAP` |
+
+`dock` is newer than the measurements in section 2, which were taken before it
+existed, and it is only there when the client is run with `SANDBOX_DOCK=1`. It
+does not scale with the screen or with the number of controls on it.
+
+Measured over 21 runs on an idle `cmd` console, on a 1024x768 desktop:
+
+| | us |
+|---|---|
+| first frame | 904 (one-off: the brushes and font are created here) |
+| mean | **~277** |
+| range | 211–398 |
+
+About 0.8% of a 33 ms budget, or 3% of an idle frame — the same order as `fills`,
+an order below `windows`. It is a **per-frame** cost, so it scales with the frame
+rate: 1.6% of a core at 60 fps.
+
+The enumeration is the suspected bulk of it, and `PrintScreen` already enumerates
+the desktop's top-level windows a few lines earlier, so passing that list to
+`DrawDock` would remove it. Not done: at 0.8% of a budget, for an opt-in switch,
+it is not worth the extra parameter.
 
 `windows` is split again into `toplevel` (the `PrintWindow` on each top-level
 window) and `child` (the `PrintWindowTree` re-print of descendants), each reported

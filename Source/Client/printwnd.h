@@ -46,6 +46,16 @@ unsigned GetLastPrintWindowCallCount();
 const unsigned char* GetLastFrameBits();
 int GetLastFrameStride();
 
+// The last captured frame's width, and the frame row the dock starts at.
+//
+// The dock is drawn over the bottom of the desktop, so DockTop is the screen's
+// height minus the dock's. With the dock off it equals the frame's own height,
+// which a frame coordinate can never reach, so the dock is then never hit.
+// Input arrives in frame coordinates, so this is what tells a click on the dock
+// from a click on the desktop.
+int GetLastFrameWidth();
+int GetLastDockTop();
+
 // Where the last PrintScreen() pass spent its time, in microseconds. The parts
 // scale with different things: WindowPass with the number of controls, the rest
 // with screen area.
@@ -58,6 +68,7 @@ struct CaptureBreakdown
 	ULONGLONG ChildReprint;   //   of which: the extra pass over descendants
 	unsigned  TopLevelCalls;  //   of which: how many of each
 	unsigned  ChildCalls;
+	ULONGLONG Dock;           // drawing the window strip
 	ULONGLONG ToGdiPlus;      // Bitmap::FromHBITMAP
 	ULONGLONG Total;          // whole call, for cross-checking the parts
 };

@@ -9,6 +9,7 @@
 #include <iostream>
 
 #include "../Common/SandboxLog.h"
+#include "Dock.h"
 #include "printwnd.h"
 
 using namespace std;
@@ -149,6 +150,15 @@ static void* gTargetBits = NULL;
 static int gTargetWidth = 0;
 static int gTargetHeight = 0;
 
+// The frame row the dock starts at, and the frame's width.
+//
+// The dock is drawn over the bottom of the desktop rather than appended below
+// it, so the frame is exactly the screen and the host's window is the same size
+// whether the dock is on or not. DockTop is then the screen's height minus the
+// dock's, and equals the frame's own height when the dock is off.
+static int gFrameWidth = 0;
+static int gDockTop = 0;
+
 // PrintWindow() calls made since the last PrintScreen() reset.
 static unsigned gPrintWindowCalls = 0;
 
@@ -270,10 +280,37 @@ BOOL CALLBACK EnumWindowsProc(
 
 	RECT r;
 	GetWindowRect(hwnd, &r);
-	int x = r.left;
-	int y = r.top;
-	int w = r.right - r.left;
-	int h = r.bottom - r.top;
+
+	// Where the window's rect starts, which is not where it is drawn.
+	//
+	// A maximized window's rect runs past the screen by the width of the
+	// invisible resize border Windows gives it, so GetWindowRect returns a rect
+	// larger than the display -- (-8, -8, 1032, 750) for a 1024x768 screen. That
+	// is what the descendants below are positioned against, so it is kept.
+	const int OriginX = r.left;
+	const int OriginY = r.top;
+
+	// What is actually drawn has to be clamped to the screen.
+	//
+	// BitBlt clips its destination, so a window drawn at a negative origin loses
+	// the matching strip at the far edge: the copy runs off the target and the
+	// last few columns are never written, leaving bare desktop where the
+	// window's right edge should be. It is the same at the bottom, which is
+	// normally hidden by the dock.
+	int Left = r.left;
+	int Top = r.top;
+	int Right = r.right;
+	int Bottom = r.bottom;
+
+	if (Left < 0) Left = 0;
+	if (Top < 0) Top = 0;
+	if (Right > Param->ScreenWidth) Right = Param->ScreenWidth;
+	if (Bottom > Param->ScreenHeight) Bottom = Param->ScreenHeight;
+
+	const int x = Left;
+	const int y = Top;
+	const int w = Right - Left;
+	const int h = Bottom - Top;
 
 	if (w <= 0 || h <= 0)
 	{
@@ -295,7 +332,13 @@ BOOL CALLBACK EnumWindowsProc(
 	// frame, and no capture pass is obliged to paint all of it. Fill with the
 	// desktop colour first so anything left unpainted blends into the
 	// background instead of showing the previously captured window's pixels.
-	RECT Scratch{ 0, 0, w, h };
+	//
+	// Only the part that will be copied out, which starts where the window's
+	// rect does rather than at the scratch's own corner.
+	const int SrcX = x - OriginX;
+	const int SrcY = y - OriginY;
+
+	RECT Scratch{ SrcX, SrcY, SrcX + w, SrcY + h };
 	FillRect(hdcWindowMemory, &Scratch, GetSysColorBrush(COLOR_DESKTOP));
 
 	LARGE_INTEGER PrintStart;
@@ -309,9 +352,9 @@ BOOL CALLBACK EnumWindowsProc(
 	// Re-print every visible descendant. PrintWindow reaches children through
 	// its PRF_CHILDREN pass, and that pass does not reliably draw themed common
 	// controls -- a status bar comes out with its background but no parts.
-	PrintWindowTree(hwnd, hdcWindowMemory, x, y);
+	PrintWindowTree(hwnd, hdcWindowMemory, OriginX, OriginY);
 
-	BitBlt(Param->hdcMemory, x, y, w, h, hdcWindowMemory, 0, 0, SRCCOPY);
+	BitBlt(Param->hdcMemory, x, y, w, h, hdcWindowMemory, SrcX, SrcY, SRCCOPY);
 
 	DeleteDC(hdcWindowMemory);
 	ReleaseDC(hwnd, hdcWindow);
@@ -493,21 +536,46 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	int capX = GetDeviceCaps(hdcSource, HORZRES);
 	int capY = GetDeviceCaps(hdcSource, VERTRES);
 
+	// The dock lies over the bottom of the screen, not below it, so the frame is
+	// exactly the screen and the host's window does not change size when the
+	// dock is switched on. What gives way instead is the desktop's work area,
+	// which the client reserves to match; see ReserveScreenBottom.
+	const int FrameHeight = capY;
+
+	// Where the dock begins, and so what the input path measures dock clicks
+	// against. Recorded here rather than at the end, so a capture that fails
+	// partway through still leaves the input path with a usable answer.
+	gFrameWidth = capX;
+	gDockTop = capY - DockHeight();
+
 	HDC hdcMemory = CreateCompatibleDC(hdcSource);
 
 	// One scratch bitmap shared by every window and every frame, so it is not
 	// reallocated per window. Rebuilt only when the screen size changes, which
 	// it can: see SANDBOX_RESOLUTION.
-	if (!ghTempBitmap || gTempBitmapWidth != capX || gTempBitmapHeight != capY)
+	//
+	// Bigger than the screen by the widest resize border the system hands out,
+	// and it has to be. A maximized window's rect runs past the screen by that
+	// much on every side -- (-8, -8, 1032, 750) on a 1024x768 display -- and
+	// PrintWindow paints the window into the DC by its rect, so the part that is
+	// actually on screen starts at the border offset rather than at the DC's
+	// corner. A scratch the size of the screen clips the far edge away before
+	// the copy out, which is what left a strip of bare desktop down the right of
+	// a maximized window.
+	const int Border = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+	const int ScratchWidth = capX + Border * 2;
+	const int ScratchHeight = capY + Border * 2;
+
+	if (!ghTempBitmap || gTempBitmapWidth != ScratchWidth || gTempBitmapHeight != ScratchHeight)
 	{
 		if (ghTempBitmap)
 		{
 			DeleteObject(ghTempBitmap);
 		}
 
-		ghTempBitmap = CreateCompatibleBitmap(hdcSource, capX, capY);
-		gTempBitmapWidth = capX;
-		gTempBitmapHeight = capY;
+		ghTempBitmap = CreateCompatibleBitmap(hdcSource, ScratchWidth, ScratchHeight);
+		gTempBitmapWidth = ScratchWidth;
+		gTempBitmapHeight = ScratchHeight;
 	}
 
 	// The full-screen target, reused across frames. See gTargetBitmap.
@@ -515,7 +583,7 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	Begin(AllocStart);
 
 	void* Bits = NULL;
-	HBITMAP hBitmap = EnsureTargetBitmap(hdcSource, capX, capY, &Bits);
+	HBITMAP hBitmap = EnsureTargetBitmap(hdcSource, capX, FrameHeight, &Bits);
 
 	gBreakdown.BitmapAlloc = Since(AllocStart);
 
@@ -568,6 +636,17 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	gBreakdown.TopLevelCalls = gTopLevelCalls;
 	gBreakdown.ChildCalls = gChildCalls;
 
+	// The dock goes on last, so it covers the windows behind it -- which is what
+	// a taskbar does, and why dragging a window down makes it slide behind the
+	// dock rather than under the pointer. It is drawn rather than composited by
+	// the host so it can use GDI's text; see Dock.h.
+	LARGE_INTEGER DockStart;
+	Begin(DockStart);
+
+	DrawDock(hdcMemory, 0, capY - DockHeight(), capX);
+
+	gBreakdown.Dock = Since(DockStart);
+
 	// If you uncomment this, it will draw the entire screen but it will look very messy, and there will be no console windows
 	//BitBlt(hdcMemory, 0, 0, capX, capY, hdcSource, 0, 0, SRCCOPY);
 
@@ -589,7 +668,7 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	// this replaces.
 	{
 		DWORD* Pixel = (DWORD*)Bits;
-		const size_t Count = (size_t)capX * capY;
+		const size_t Count = (size_t)capX * FrameHeight;
 
 		for (size_t i = 0; i < Count; ++i)
 		{
@@ -602,7 +681,7 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	//
 	// The returned bitmap does not own the pixels, and must not outlive the next
 	// PrintScreen call, which redraws the same buffer.
-	Bitmap* bmp = new Bitmap(capX, capY, capX * 4, PixelFormat32bppARGB, (BYTE*)Bits);
+	Bitmap* bmp = new Bitmap(capX, FrameHeight, capX * 4, PixelFormat32bppARGB, (BYTE*)Bits);
 
 	if (bmp && bmp->GetLastStatus() != Ok)
 	{
@@ -733,6 +812,16 @@ int GetLastFrameStride()
 {
 	// Top-down 32bpp DIB: rows are contiguous, no padding.
 	return gTargetWidth * 4;
+}
+
+int GetLastFrameWidth()
+{
+	return gFrameWidth;
+}
+
+int GetLastDockTop()
+{
+	return gDockTop;
 }
 
 const CaptureBreakdown& GetLastCaptureBreakdown()

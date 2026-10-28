@@ -171,7 +171,8 @@ powershell -c "Test-NetConnection <host address> -Port 5001"
 ### 4.4 What to expect
 
 The host window shows the container's desktop — the background colour plus
-whatever program was started — and responds to mouse and keyboard.
+whatever program was started — and responds to mouse and keyboard. With
+`SANDBOX_DOCK=1` there is a strip of window buttons below it; see section 4.5.
 
 **Neither program prints anything by default.** To see output, set
 `SANDBOX_DEBUG=1` on whichever side you are interested in:
@@ -193,6 +194,62 @@ it:
 | No output, exit code 2 | The client was not given `SANDBOX_HOST` |
 | No output, exit code 1 | Initialisation failed (RPC registration or binding); set `SANDBOX_DEBUG` to see why |
 
+### 4.5 The dock
+
+Set **`SANDBOX_DOCK=1`** on the client and a strip of window buttons appears along
+the bottom of the desktop: one per top-level window in the container, with its
+title. Without it there is no dock.
+
+A container has no shell. There is no taskbar and no Alt+Tab, and a minimized
+window has no pixels for the capture to paint — so without the dock, minimizing a
+window loses it.
+
+| Click on | Result |
+|---|---|
+| A minimized window's button (drawn dimmed) | Restores it and brings it forward |
+| A background window's button | Brings it forward |
+| The button of the window already in front | Minimizes it |
+
+**It behaves the way a real taskbar does, in both directions.**
+
+*Drawn over the desktop.* The frame is exactly the screen, so the host's window
+is the same size whether the dock is on or not, and dragging a window down slides
+it behind the dock rather than under the pointer.
+
+*Reserved out of the work area.* The client narrows the container's work area by
+the dock's height, which is what a taskbar does with the space it occupies.
+Maximized windows stop at the dock instead of disappearing behind it, and
+anything that centres itself in the work area is centred in what is left. **The
+container sees a smaller usable area, not a smaller screen** — `SM_CYSCREEN` and
+`GetDeviceCaps(VERTRES)` are unchanged.
+
+The reservation is read back and checked, and reported under `SANDBOX_DEBUG=1`:
+
+```
+Work area reserved: bottom 26 rows
+```
+
+If it says `Work area could not be reserved` or `Work area stayed 800x600 rather
+than 1024x768`, the system refused it and maximized windows will extend behind the
+dock. Everything else about the dock still works.
+
+**The host is not told the dock exists.** The frame is the screen, the desktop
+still starts at its top-left corner, and the work area is the container's own
+business — so the host's scaling, drawing and pointer mapping all keep working
+unchanged. What needs care is the cursor, which is the client's to place: a dock
+click never reaches the container, so the container's cursor is never moved
+there, and reporting it would strand the pointer while the user aims at a button.
+The client reports the host's pointer position instead, and the host draws the
+cursor there without knowing why.
+
+> The buttons keep the order the windows first appeared in, not z-order. Z-order
+> changes every time a window is activated, and buttons that reshuffle under the
+> cursor cannot be clicked.
+>
+> A minimized window is never drawn as the active one, even when it is still the
+> foreground window — which it can be, because minimizing a window does not
+> necessarily hand the foreground to anything else.
+
 ---
 
 ## 5. Configuration
@@ -204,6 +261,7 @@ Everything is an **environment variable**. Unset means the default.
 | `SANDBOX_PORT` | `5001` | both | RPC endpoint |
 | `SANDBOX_HOST` | none | client | Server address; required |
 | `SANDBOX_RESOLUTION` | none | client | Container desktop size, `WIDTHxHEIGHT` |
+| `SANDBOX_DOCK` | none | client | Set to `1` to draw the dock below the desktop |
 | `SANDBOX_FPS` | `30` | client | Capture rate, 1–240 |
 | `SANDBOX_DEBUG` | none | both | Set to `1` to print anything |
 
@@ -359,6 +417,38 @@ If it is still dead, set `SANDBOX_DEBUG=1` on the client: `SendInput for wheel
 returned false` means the injection itself was refused, which is a different
 problem from the event never arriving.
 
+### A window I minimized has vanished
+
+A minimized window has no pixels, so the capture skips it, and there is no shell
+in the container to restore it from. With `SANDBOX_DOCK=1` its button is in the
+dock, drawn dimmed; click it to bring the window back. See section 4.5.
+
+If a window has no button at all, it is either not visible, has no title, or is a
+tool window (`WS_EX_TOOLWINDOW`), which the dock filters out the way a taskbar
+does.
+
+### A maximized window has a strip of bare desktop down its right edge
+
+Windows gives a maximized window an **invisible resize border**, so
+`GetWindowRect` on one returns a rect *larger than the display* —
+`(-8, -8, 1032, 750)` on a 1024x768 screen.
+
+`PrintWindow` paints a window into the device context by its rect, so the part
+that is actually on screen starts at the border offset rather than at the
+context's corner. A scratch bitmap the size of the screen therefore clips the far
+edge away **before the copy out**, and no amount of adjusting the `BitBlt`
+afterwards can recover it — the columns were never painted.
+
+`printwnd.cpp` allocates the scratch at the screen size plus twice
+`SM_CXSIZEFRAME + SM_CXPADDEDBORDER`, clamps the destination to the screen, and
+offsets the source by the same amount. The descendants are still positioned
+against the **unclamped** rect origin, because their coordinates are relative to
+it.
+
+> The bottom edge is affected identically and is easy to miss: without the dock
+> the work area is the whole screen, so a maximized rect's bottom runs past it
+> and the last rows are lost too. The dock covers them.
+
 ### The status bar flickers, or dialog buttons do
 
 There is **no DWM in the container** (`tasklist /fi "imagename eq dwm.exe"`
@@ -432,8 +522,8 @@ manager.
 
 With `SANDBOX_DEBUG=1`, the client prints once a second. A frame is split into
 `capture`, `encode` and `send`; `capture` is split into `alloc`, `fills`,
-`windows` and `toGdi+`; `windows` is split into `toplevel` and `child` with
-per-call costs. The last two lines give the capacity answer directly.
+`windows`, `dock` and `toGdi+`; `windows` is split into `toplevel` and `child`
+with per-call costs. The last two lines give the capacity answer directly.
 
 What the parts mean, the measured numbers, and the A/B experiments behind the
 current design are in [PERFORMANCE.md](PERFORMANCE.md).

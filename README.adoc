@@ -95,6 +95,11 @@ Everything is an environment variable.
 only the modes its stub display driver advertises are accepted; anything else
 falls back to the default. See `Docs/BUILD.md` for the list.
 
+| `SANDBOX_DOCK`
+| none
+| Set to `1` to draw the dock — a strip of window buttons — below the desktop,
+so a minimized window can be brought back.
+
 | `SANDBOX_FPS`
 | `30`
 | Capture rate. The per-frame cost is roughly fixed, so this trades container CPU
@@ -130,6 +135,18 @@ client can see and send input to.
 From then on it loops: paint every window into one bitmap, encode it as PNG, and
 send it to the host in a single RPC call that also carries back whatever input
 arrived. Frames whose pixels are identical to the previous one are not sent.
+
+A minimized window has no pixels to paint, and a container has no shell, so there
+is no taskbar to bring it back from — it would simply be gone. With
+`SANDBOX_DOCK=1` the client draws one: the dock, a strip of window buttons along
+the bottom of the desktop. Clicking a button restores that window and brings it
+forward; clicking the button of the window already in front minimizes it.
+
+The dock behaves the way a taskbar does, in both directions. It is drawn over the
+bottom of the desktop, so the frame is exactly the screen and the host's window
+is the same size either way. And the client narrows the container's work area by
+the dock's height, so a maximized window stops above it: the container sees a
+smaller usable area, not a smaller screen. The host is not told any of this.
 
 The cursor is not painted into that bitmap. It travels separately and the host
 composites it, because a cursor baked into the frame makes the pixels underneath

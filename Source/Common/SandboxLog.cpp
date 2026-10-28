@@ -5,6 +5,8 @@
 #include <iostream>
 #include <streambuf>
 
+#include "SandboxEnv.h"
+
 namespace
 {
 	// Throws away everything written to it, so the caller's stream expression
@@ -44,26 +46,13 @@ namespace
 	private:
 		NullWBuffer Buffer;
 	};
-
-	bool ReadFlag(const char* Name)
-	{
-		char Value[8] = { 0 };
-
-		if (!GetEnvironmentVariableA(Name, Value, sizeof(Value)))
-		{
-			return false;
-		}
-
-		return Value[0] == '1' || Value[0] == 'y' || Value[0] == 'Y'
-			|| Value[0] == 't' || Value[0] == 'T';
-	}
 }
 
 bool DebugEnabled()
 {
 	// Read once. The environment cannot change under a running process, and the
 	// frame profiler calls this every frame.
-	static const bool Enabled = ReadFlag("SANDBOX_DEBUG");
+	static const bool Enabled = SandboxFlag("SANDBOX_DEBUG");
 
 	return Enabled;
 }

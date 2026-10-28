@@ -91,6 +91,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\Source\Client\Client.cpp" />
+    <ClCompile Include="..\..\Source\Client\Dock.cpp" />
     <ClCompile Include="..\..\Source\Client\Init.cpp" />
     <ClCompile Include="..\..\Source\Client\main.cpp" />
     <ClCompile Include="..\..\Source\Client\printwnd.cpp" />
@@ -101,6 +102,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Source\Client\Client.h" />
+    <ClInclude Include="..\..\Source\Client\Dock.h" />
     <ClInclude Include="..\..\Source\Client\Init.h" />
     <ClInclude Include="..\..\Source\Client\printwnd.h" />
     <ClInclude Include="..\..\Source\Common\SandboxEnv.h" />
