@@ -1,61 +1,74 @@
-# 音频透传可行性调研
+# Audio: feasibility
 
-结论先说：**容器里没有音频端点，没有可抓的流。** 唯一可行的路线是**在用户态伪造一个音频端点**，成本是另起一个项目，不是给现有 POC 加模块。
+**There is no audio endpoint in the container and no stream to capture.** The
+only route that could work is faking an endpoint in user mode, which is a
+separate project rather than a module added to this one.
 
-本文记录实测数据和判断依据，避免以后重复调研。
-
----
-
-## 1. 实测结果
-
-在 `mcr.microsoft.com/windows/servercore:20H2` 容器里：
-
-```
-waveOutGetNumDevs()                        → 0
-Get-CimInstance Win32_SoundDevice          → 空
-Get-Service Audiosrv, AudioEndpointBuilder → 空（服务不存在）
-
-C:\Windows\System32\MMDevAPI.dll           → 存在
-C:\Windows\System32\audioses.dll           → 不存在
-C:\Windows\System32\winmm.dll              → 存在
-C:\Windows\System32\dsound.dll             → 不存在
-C:\Windows\System32\XAudio2_9.dll          → 不存在
-
-HKLM\SOFTWARE\Classes\CLSID\{BCDE0395-E52F-467C-8E3D-C4579291692E}  → 已注册
-    \InprocServer32                        → 存在
-```
-
-`{BCDE0395-E52F-467C-8E3D-C4579291692E}` 是 `MMDeviceEnumerator` 的 CLSID。
+Recorded here so it does not have to be investigated twice.
 
 ---
 
-## 2. 为什么补不上
+## 1. Measured
 
-音频和画面走的是完全不同的机制：
+Inside a Server Core container:
 
-| | 画面 | 声音 |
+```
+waveOutGetNumDevs()                        -> 0
+Get-CimInstance Win32_SoundDevice          -> empty
+Get-Service Audiosrv, AudioEndpointBuilder -> empty (services do not exist)
+
+C:\Windows\System32\MMDevAPI.dll           -> present
+C:\Windows\System32\audioses.dll           -> absent
+C:\Windows\System32\winmm.dll              -> present
+C:\Windows\System32\dsound.dll             -> absent
+C:\Windows\System32\XAudio2_9.dll          -> absent
+
+HKLM\SOFTWARE\Classes\CLSID\{BCDE0395-E52F-467C-8E3D-C4579291692E}  -> registered
+    \InprocServer32                        -> present
+```
+
+`{BCDE0395-E52F-467C-8E3D-C4579291692E}` is `MMDeviceEnumerator`.
+
+---
+
+## 2. Why it cannot be filled in
+
+Video and audio depend on entirely different machinery:
+
+| | Video | Audio |
 |---|---|---|
-| 依赖 | Win32k 的虚拟桌面 | 内核音频驱动提供的端点 |
-| 容器里 | Server Core 自带 Win32k，POC 自建 WinSta0 即可用 | 独立的设备命名空间，**没有硬件就没有端点** |
+| Depends on | Win32k's virtual desktop | An endpoint provided by a kernel audio driver |
+| In the container | Win32k is present; the client creates its own WinSta0 | A separate device namespace — **no hardware, no endpoint** |
 
-补不上的具体原因：
+Specifically:
 
-- **进程隔离容器共享宿主内核**，装驱动等于在宿主上装驱动，容器平台会拦
-- **Hyper-V 隔离容器的内核在 Docker 管理的工具 VM 里**，进不去
-- Windows 没有"空音频设备"这种东西，`waveOutGetNumDevs()` 在无硬件机器上就是 0
-- 容器镜像的组件集构建时固定，`Install-WindowsFeature` 加不了音频组件（加了也还是没有设备）
+- **Process-isolated containers share the host kernel**, so installing a driver
+  means installing it on the host, which the container platform refuses.
+- **Hyper-V-isolated containers run their kernel in a utility VM** managed by
+  Docker, which is not reachable.
+- Windows has no concept of a null audio device. `waveOutGetNumDevs()` returns 0
+  on a machine with no hardware, by design.
+- The image's component set is fixed at build time. `Install-WindowsFeature`
+  cannot add audio components, and would not help if it could — there is still
+  no device.
 
-所以容器里的程序调用音频 API 会直接失败：`GetDefaultAudioEndpoint` 返回 `E_NOTFOUND`，`waveOutOpen` 返回 `MMSYSERR_NODRIVER`。**没有流可以抓。**
+So audio APIs fail outright in the container: `GetDefaultAudioEndpoint` returns
+`E_NOTFOUND`, `waveOutOpen` returns `MMSYSERR_NODRIVER`. **There is no stream to
+capture.**
 
 ---
 
-## 3. 唯一可行的路线：用户态伪造端点
+## 3. The only route: fake an endpoint in user mode
 
-不去抓设备输出，而是**让程序以为有设备**，把它写进音频缓冲的 PCM 截下来，走 RPC 送到宿主机播放。
+Rather than capturing a device's output, make programs believe a device exists,
+intercept the PCM they write into its buffer, and send it to the host to play.
 
-### 需要实现的接口
+### Interfaces that would have to be implemented
 
-`audioses.dll` 不存在意味着**不能只 hook 枚举层**——即使枚举成功，`IMMDevice::Activate` 也拿不到 `IAudioClient`（实现在 AudioSes 服务里，服务不存在）。所以必须自己把整条链实现出来：
+`audioses.dll` being absent means **hooking the enumeration layer alone is not
+enough**: even if enumeration succeeded, `IMMDevice::Activate` could not produce
+an `IAudioClient`, because that lives in the AudioSes service, which does not
+exist. The whole chain has to be implemented:
 
 ```
 IMMDeviceEnumerator   GetDefaultAudioEndpoint, EnumAudioEndpoints, GetDevice,
@@ -67,59 +80,78 @@ IAudioClient          Initialize, GetBufferSize, GetMixFormat, IsFormatSupported
 IAudioRenderClient    GetBuffer, ReleaseBuffer
 ```
 
-约 30 个方法。`QueryInterface` 还要应答 `IAudioClient2` / `IAudioClient3`，不少应用会 QI 更高版本。
+About 30 methods. `QueryInterface` also has to answer for `IAudioClient2` and
+`IAudioClient3`, which many applications ask for.
 
-**最容易低估的一环是时钟**：没有真实设备就没有硬件时钟，`GetCurrentPadding` 的返回值决定应用的写入节奏，必须按采样率自己推演，否则应用会跑飞或卡死。
+**The clock is the part most likely to be underestimated.** With no real device
+there is no hardware clock, and the value returned by `GetCurrentPadding` is what
+paces the application's writes. It has to be derived from the sample rate, or
+applications will run away or stall.
 
-### 投递方式：改 COM 注册，不用注入
+### Delivery: replace the COM registration, no injection
 
-`MMDeviceEnumerator` 的 CLSID 已注册在注册表里指向 `MMDevAPI.dll`。**容器里本来就没有音频，把这个 `InprocServer32` 改指向自己的 shim DLL 是无损的**：
+`MMDeviceEnumerator`'s CLSID is registered to `MMDevAPI.dll`. **The container has
+no audio anyway, so repointing that `InprocServer32` at a shim DLL is lossless:**
 
 ```
 HKLM\SOFTWARE\Classes\CLSID\{BCDE0395-E52F-467C-8E3D-C4579291692E}\InprocServer32
-    (Default) → shim DLL 路径
+    (Default) -> path to the shim DLL
 ```
 
-这样容器里任何进程做 `CoCreateInstance(CLSID_MMDeviceEnumerator)` 都会加载我们的实现，**不需要 `SetWindowsHookEx`、不需要 Detours、不需要注入**。需要出 32 位和 64 位两份 DLL。
+Any process in the container calling `CoCreateInstance(CLSID_MMDeviceEnumerator)`
+then loads the shim, with **no `SetWindowsHookEx`, no Detours, no injection**. Both
+32- and 64-bit builds are needed.
 
-### 不需要覆盖的层
+### Layers that do not need covering
 
-`dsound.dll` 和 `XAudio2_9.dll` 在容器里不存在，任何依赖它们的程序本来就跑不了音频，**不在覆盖范围内**。`winmm.dll` 存在但 0 设备，`waveOutOpen` 直接失败，伪造它是可选的补充（纯 C API，比 WASAPI 简单得多）。
+`dsound.dll` and `XAudio2_9.dll` are absent, so anything depending on them cannot
+play audio in the container in the first place. `winmm.dll` is present with zero
+devices, so `waveOutOpen` fails; shimming it is an optional extra and much
+simpler than WASAPI, being a plain C API.
 
 ---
 
-## 4. 成本估计
+## 4. Rough cost
 
-| 部分 | 估计 |
+| Part | Estimate |
 |---|---|
-| WASAPI shim（4 个接口 + COM 注册替换 + 格式协商 + 自造时钟） | 1～2 周 |
-| waveOut 伪造（纯 C API） | 2～3 天，可选 |
-| 传输层（IDL 扩展 + 客户端音频线程 + 宿主机 SDL 播放） | 3～5 天，**技术上是确定的部分** |
+| WASAPI shim (4 interfaces, COM registration swap, format negotiation, invented clock) | 1–2 weeks |
+| waveOut shim (plain C API) | 2–3 days, optional |
+| Transport (IDL extension, client audio thread, host-side SDL playback) | 3–5 days, **the certain part** |
 
-传输层与图像那三个 RPC 方法完全对称，不难。真正的不确定点在 shim 的时钟和格式协商。
+The transport mirrors the three image RPC methods closely and is not difficult.
+The real uncertainty is the shim's clock and format negotiation.
 
-**客户端要加一个独立线程**：现有客户端是单线程循环（抓屏 → 编码 → 发送 → 拉事件），而音频捕获是回调驱动的，必须单独线程 + 队列，再与视频共用同一个 binding handle 发出。
-
----
-
-## 5. 什么时候不该做
-
-- 现有用例（IT 管理员跑 GUI 安装程序、导出镜像、轻量测试可疑程序）**都不需要声音**
-- 如果目标是"看视频 / 听声音"，**容器不是合适的载体**。虚拟机音频直通成熟得多
-- **RDP 这条路也不通**：镜像里有完整的 RDP 服务端栈，但实测**在容器里根本起不来**（协议栈硬依赖 UMBus + PnP，见 [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md) 第 4 节）。而且**这个镜像里没有 `rdpsnd.dll`**——扫遍两层，`System32` 下没有任何名字带 audio/snd/mixer/wave 的文件。两条都不成立
+**The client would need a second thread.** It is currently a single loop
+(capture, encode, send, drain events), whereas audio capture is callback-driven
+and needs its own thread and queue, sharing the binding handle with video.
 
 ---
 
-## 6. 如果要做，先做去风险 spike
+## 5. When not to do it
 
-**不要先搭管道。** 先写一个最小 spike 验证核心假设：
+- The existing use cases — installing a GUI application, exporting an image,
+  testing a suspicious program in a lightweight sandbox — **none need sound**.
+- If the goal is watching video or listening to audio, **a container is the wrong
+  vehicle**. VM audio passthrough is far more mature.
+- **RDP is not an alternative.** The image contains a complete RDP server stack,
+  but it cannot start in a container (the protocol stack depends on UMBus and PnP
+  enumeration; see [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md)). This image also has no
+  `rdpsnd.dll` — nothing under `System32` has audio, snd, mixer or wave in its
+  name. Both routes are closed.
 
-在容器里放一个 shim DLL，替换 `MMDeviceEnumerator` 的 COM 注册，然后写一个几行的 WASAPI 播放程序当靶子，确认它能：
+---
 
-1. 拿到一个"默认设备"
-2. `Initialize` 成功
-3. 在 `GetBuffer` 里拿到**连续、节奏正常**的 PCM
+## 6. If it is done, start with a de-risking spike
 
-**这一步过了，后面才有意义；过不了说明伪造端点的复杂度超出预期，及时止损。** 约一天，是整件事里唯一真正的技术不确定点。
+**Do not build the transport first.** Write the smallest spike that tests the core
+assumption: put a shim DLL in the container, replace the `MMDeviceEnumerator` COM
+registration, and write a few lines of WASAPI playback as a target. Confirm it can
 
-传输层等 spike 过了再写。
+1. obtain a "default device",
+2. `Initialize` successfully, and
+3. receive **continuous, correctly paced** PCM in `GetBuffer`.
+
+**If that passes, the rest is worth building; if it does not, the shim is more
+complex than estimated and the work should stop there.** About a day, and it is
+the only genuinely uncertain part.

@@ -1,10 +1,17 @@
+# Build output
 /Output
 /Binaries
-/.vs
 
-# Extracted container image used for reverse engineering
+# Per-machine editor and assistant state, which holds local paths
+/.vs
+/.claude
+
+# Extracted container images used for reverse engineering
 /servercore20h2
 /servercore20h2.tar
+/serverltsc2025
+/serverltsc2025.tar
 
 # Per-user Visual Studio settings
 *.vcxproj.user
+

@@ -1,273 +1,465 @@
-# 编译与运行
+# Building and running
 
-本文记录 Windows Container View 的编译、部署和运行步骤，以及排查过程中确认的几个关键点。
+Build, deployment and troubleshooting for Windows Container View, plus the
+things that were established the hard way while getting it to work.
 
-架构说明见仓库根目录的 `README.adoc`。
+Architecture and use cases are in the `README.adoc` at the repository root.
 
 ---
 
-## 1. 环境要求
+## 1. Requirements
 
-| 组件 | 说明 |
+| Component | Notes |
 |---|---|
-| Visual Studio 2019 或更高 | 工程使用 v142 工具集，需安装「使用 C++ 的桌面开发」工作负载 |
-| SDL2 2.32.2 开发库 | 见第 2 节，需放在仓库根目录 |
-| Docker | 用于运行 Windows 容器（进程隔离或 Hyper-V 隔离） |
-| Windows 10/11 或 Windows Server | 需启用 Containers 功能 |
+| Visual Studio 2019 or later | The projects use the v142 toolset and need the "Desktop development with C++" workload |
+| SDL2 2.32.2 development libraries | See section 2; already in the repository |
+| Docker | To run the container |
 
-运行端还需要 **VC++ 2019 x64 运行库**。
+**x64 only.** The projects have no Win32 configurations.
 
 ---
 
 ## 2. SDL2
 
-`SDL2/` 是第三方二进制 SDK（SDL2 2.32.2 + SDL2_image，约 19 MB / 108 个文件），**已纳入版本控制**，克隆下来即可编译，不需要额外下载。只保留了编译和运行需要的部分，上游发行包里的 `docs/`、`cmake/`、`lib/x86/` 和顶层说明文件没有收录。
-
-结构：
+`SDL2/` is a third-party binary SDK (SDL2 2.32.2 plus SDL2_image, about 19 MB
+across 108 files) and is **checked in**, so a clone builds without downloading
+anything. Only the parts needed to build and run are kept; the upstream
+distribution's `docs/`, `cmake/`, `lib/x86/` and top-level files are not included.
 
 ```
 SDL2/
-├── include/SDL2/              头文件（92 个）。源码里写的是 #include <SDL2/SDL.h>，
-│                              include/ 下没有平铺的 SDL.h，前缀不能省
+├── include/SDL2/              92 headers. The source includes <SDL2/SDL.h>, and
+│                              there is no flat SDL.h under include/, so the
+│                              prefix is required
 └── lib/x64/
-    ├── SDL2.lib  SDL2main.lib  SDL2_image.lib     链接用
-    ├── SDL2test.lib
-    ├── SDL2.dll  SDL2_image.dll                   运行用
-    ├── SDL2.pdb  SDL2_image.pdb                   调试符号，可删
+    ├── SDL2.lib  SDL2_image.lib            to link against
+    ├── SDL2.dll  SDL2_image.dll            to run
+    ├── SDL2.pdb  SDL2_image.pdb            debug symbols, safe to delete
     └── optional/
         └── libavif-16.dll  libtiff-5.dll  libwebp-7.dll  libwebpdemux-2.dll
-            + 各自的 LICENSE
+            plus their licences
 ```
 
-`Projects/Sandbox-Server/Sandbox-Server.vcxproj` 通过 `$(SolutionDir)SDL2\include` 和 `$(SolutionDir)SDL2\lib\x64` 引用它，**不依赖绝对路径**，仓库放在哪都能编译。
+`Projects/Sandbox-Server/Sandbox-Server.vcxproj` refers to it through
+`$(SolutionDir)SDL2\include` and `$(SolutionDir)SDL2\lib\x64`, so **no absolute
+paths** and the repository can live anywhere. A post-build step copies the
+runtime DLLs next to `Sandbox-Server.exe`.
 
-升级 SDL2 时，从 https://github.com/libsdl-org/SDL/releases 下载对应版本的 `SDL2-devel-<版本>-VC.zip` 和 `SDL2_image-devel-<版本>-VC.zip`，取其中的 `include/SDL2/`、`lib/x64/` 覆盖进来即可。
-
-运行目录还需要 `SDL2.dll`、`SDL2_image.dll` 及 `lib/x64/optional/` 下的四个 DLL，见第 3 节。
+To upgrade SDL2, download `SDL2-devel-<version>-VC.zip` and
+`SDL2_image-devel-<version>-VC.zip` from
+https://github.com/libsdl-org/SDL/releases and copy their `include/SDL2/` and
+`lib/x64/` over the existing ones.
 
 ---
 
-## 3. 编译
+## 3. Building
 
-用 Visual Studio 打开 `Sandbox.sln`，选 `Debug|x64`，生成解决方案。
-
-或者命令行：
+Open `Sandbox.sln` in Visual Studio, pick `Debug|x64` or `Release|x64`, and build.
+Or from a command line:
 
 ```powershell
 msbuild Sandbox.sln /p:Configuration=Debug /p:Platform=x64 /t:Build /m
 ```
 
-三个工程的产物都落在 `Output\x64\Debug\`：
+Both projects write to `Output\x64\<Configuration>\`:
 
-| 工程 | 产物 | 角色 |
-|---|---|---|
-| `Sandbox` | `Sandbox.exe` | 入口，按命令行参数决定跑服务端还是客户端 |
-| `Sandbox-Server` | `Sandbox-Server.dll` | 宿主机侧：RPC 服务端 + SDL2 显示 |
-| `Sandbox-Client` | `Sandbox-Client.dll` | 容器侧：抓屏 + 输入注入 |
+| Project | Output | Role | Needs at runtime |
+|---|---|---|---|
+| `Sandbox-Server` | `Sandbox-Server.exe` | Host side: RPC server and SDL display | `SDL2.dll`, `SDL2_image.dll` |
+| `Sandbox-Client` | `Sandbox-Client.exe` | Container side: capture and input injection | **Nothing but system DLLs** |
 
-`Sandbox.exe` 通过导入库隐式链接两个 DLL，**运行目录必须同时具备三个文件和全部 SDL2 相关 DLL**：
+Both link the C runtime statically, so no VC++ redistributable is required.
 
-```
-Sandbox.exe  Sandbox-Client.dll  Sandbox-Server.dll
-SDL2.dll  SDL2_image.dll
-libavif-16.dll  libtiff-5.dll  libwebp-7.dll  libwebpdemux-2.dll
-```
+**The client is a single file**, which is the point of splitting them: the
+container needs `Sandbox-Client.exe` and nothing else — no SDL2, and no mounting
+of the whole output directory.
+
+> This used to be one `Sandbox.exe` that chose a role from its command line, with
+> the two roles built as DLLs and `DelayLoadDLLs` keeping SDL out of the
+> container. Two executables shrink the container-side deployment from a
+> directory to one file and remove the delay-load workaround.
 
 ---
 
-## 4. 运行
+## 4. Running
 
-### 4.1 服务端（宿主机）
+### 4.1 Server (host)
 
-服务端**必须运行在有桌面会话的机器上**，因为它要创建 SDL 窗口显示画面。Server Core 上没有交互式桌面，`SDL_Init(SDL_INIT_VIDEO)` 会失败，窗口出不来。
+The server **needs a desktop session**, because it creates an SDL window to
+display the picture. Server Core has no interactive desktop, so
+`SDL_Init(SDL_INIT_VIDEO)` fails and no window appears.
 
 ```powershell
 cd Output\x64\Debug
-.\Sandbox.exe
+.\Sandbox-Server.exe
 ```
 
-打印 `Init` 后停住，窗口出现，等待客户端连接。
+**No command-line arguments.** The window appears and waits for the client.
 
-> `main.cpp` 里 `SandboxInitServer()` 的异常是被静默 `catch` 后 `return 0` 的，RPC 注册失败时进程会**一声不吭地退出**。别只看「没报错」就认为它活着，用 `Get-Process Sandbox` 确认。
+> A failed start exits **silently** (the exception is caught and a non-zero code
+> returned) and prints nothing by default. Do not read "no error" as "it is
+> running" — check with `Get-Process Sandbox-Server`, or set
+> `$env:SANDBOX_DEBUG=1` and run it again to see why.
 
-### 4.2 放行防火墙
+### 4.2 Firewall
 
-服务端监听固定端口 **5001**（见第 5 节）。宿主机上执行：
+The server listens on **5001** (changeable with `SANDBOX_PORT`; see section 5).
+On the host:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Sandbox RPC 5001" -Direction Inbound `
     -Protocol TCP -LocalPort 5001 -Action Allow -Profile Any
 ```
 
-`-Profile Any` 不能省——虚拟网卡（VMware host-only、docker NAT 等）常被判成 Public 配置文件。
+`-Profile Any` matters: virtual adapters (VMware host-only, the Docker NAT) are
+often classified as Public.
 
-验证监听：
+To confirm it is listening:
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 5001 | Select LocalAddress, LocalPort
 ```
 
-应看到 `0.0.0.0:5001`。
+You should see `0.0.0.0:5001`.
 
-### 4.3 客户端（容器）
+### 4.3 Client (container)
 
-容器镜像最低要求 **Server Core**（Nano Server 砍掉了 Win32k，无法创建窗口）。进程隔离和 Hyper-V 隔离都可以。
+The image must be **Server Core** or later; Nano Server removes Win32k and cannot
+create windows. **This project is for `--isolation process` only**; Hyper-V
+isolation is not supported.
 
-把 `Output\x64\Debug\` 挂载进容器，以 `client <宿主机IP>` 参数启动：
+Only `Sandbox-Client.exe` has to go into the container. The host address comes
+from `SANDBOX_HOST`:
 
 ```
 docker run --rm -ti --isolation process ^
-  -v C:\path\to\Output\x64\Debug:C:\Sandbox:ro ^
-  mcr.microsoft.com/windows/servercore:20H2 ^
-  C:\Sandbox\Sandbox client <宿主机IP>
+  -e SANDBOX_HOST=<host address> ^
+  -v C:\path\to\Sandbox-Client.exe:C:\Sandbox\Sandbox-Client.exe:ro ^
+  mcr.microsoft.com/windows/servercore:ltsc2025 ^
+  C:\Sandbox\Sandbox-Client.exe
 ```
 
-`<宿主机IP>` 是**运行 Sandbox.exe 那台机器**上、容器可达的地址：
-
-- 容器和 Sandbox.exe 在同一台机器 → 容器的默认网关，即宿主 `vEthernet (nat)` 的地址
-- 跨机器（如容器在 VM 里、Sandbox.exe 在物理机上）→ 物理机在 VM 可达网络中的地址
-
-先在容器里验证连通性：
+The command-line argument is **the program to start on the container's desktop**.
+With none it is `cmd.exe`, as it always was:
 
 ```
-powershell -c "Test-NetConnection <宿主机IP> -Port 5001"
+  C:\Sandbox\Sandbox-Client.exe notepad.exe
+  C:\Sandbox\Sandbox-Client.exe "C:\Program Files\App\app.exe"
 ```
 
-`TcpTestSucceeded : True` 才算通。
+Paths with spaces are re-quoted, so they can be passed directly.
 
-> **容器镜像版本必须与宿主 Windows build 一致**，否则进程隔离模式启动会失败。`mcr.microsoft.com/windows/servercore:20H2` 对应宿主 build 19042。
+`<host address>` is an address of the machine running `Sandbox-Server.exe` that
+the container can reach:
 
-### 4.4 预期结果
+- Both on the same machine — the container's default gateway, which is the host's
+  `vEthernet (nat)` address.
+- Across machines (container in a VM, server on a physical host) — the host's
+  address on a network the container can see.
 
-宿主机窗口显示容器内的桌面（蓝色背景 + cmd.exe 控制台），鼠标键盘可操作。
+Check connectivity from inside the container first:
 
-客户端**正常工作时是静默的**——帧循环里没有日志输出。以下都是正常现象：
+```
+powershell -c "Test-NetConnection <host address> -Port 5001"
+```
 
-| 输出 | 含义 |
+`TcpTestSucceeded : True` is what you want.
+
+> **The image build must match the host's**, or process isolation will refuse to
+> start.
+
+### 4.4 What to expect
+
+The host window shows the container's desktop — the background colour plus
+whatever program was started — and responds to mouse and keyboard.
+
+**Neither program prints anything by default.** To see output, set
+`SANDBOX_DEBUG=1` on whichever side you are interested in:
+
+```powershell
+$env:SANDBOX_DEBUG=1; .\Sandbox-Server.exe
+```
+
+```
+docker run ... -e SANDBOX_DEBUG=1 ...
+```
+
+With it set, the client prints a per-second frame profile (section 7). Without
+it:
+
+| What you see | Meaning |
 |---|---|
-| 无输出、进程持续运行 | 正常 |
-| `No more visible windows, exiting.` | 容器内所有可见窗口关闭，正常退出 |
+| No output, process keeps running | Normal |
+| No output, exit code 2 | The client was not given `SANDBOX_HOST` |
+| No output, exit code 1 | Initialisation failed (RPC registration or binding); set `SANDBOX_DEBUG` to see why |
 
 ---
 
-## 5. 端口配置
+## 5. Port and address
 
-RPC 端点定义在 `Source/Interface/SandboxConfig.h`：
+Both are **environment variables**. Unset means the default.
+
+| Variable | Default | Read by | Meaning |
+|---|---|---|---|
+| `SANDBOX_PORT` | `5001` | both | RPC endpoint |
+| `SANDBOX_HOST` | none | client | Server address; required |
+| `SANDBOX_DEBUG` | none | both | Set to `1` to print anything |
+
+The default port is in `Source/Interface/SandboxConfig.h`:
 
 ```c
 #define SANDBOX_RPC_ENDPOINT L"5001"
 ```
 
-**客户端和服务端必须使用同一个值**，修改后需要重新编译 `Sandbox-Client.dll` 和 `Sandbox-Server.dll` 两侧。
+**Both sides must use the same port.** They each read `SANDBOX_PORT` from their
+own environment, so either set it on both or on neither.
 
-### 为什么用固定端口
+> The port used to be a compile-time constant, so changing it meant rebuilding
+> both sides — and the two sides are built and deployed separately, the client
+> into an image and the server onto a host. The address used to be a
+> command-line argument, which crowded out the thing the command line is
+> actually needed for: **which program to start**.
 
-原实现用 `RpcServerUseProtseq` + `RpcEpRegister` 注册**动态端口**，客户端必须先连宿主机 TCP 135 的 endpoint mapper 查询真实端口，再连那个动态端口。这带来三个问题：
+### Why a fixed port
 
-1. 防火墙要同时放行 135 和一个每次重启都变的动态端口
-2. 服务进程（无交互会话）不会弹出防火墙授权对话框，动态端口无法预先配置规则
-3. 跨网段部署时 135 经常被拦
+The original implementation registered a **dynamic** endpoint with
+`RpcServerUseProtseq` plus `RpcEpRegister`, so a client first had to ask the
+host's endpoint mapper on TCP 135 which port to use. Three problems:
 
-改用 `RpcServerUseProtseqEp` 指定固定端点后，客户端在 string binding 里直接写明端口，**不再需要 endpoint mapper，TCP 135 完全不用开**。
+1. The firewall had to allow 135 *and* a port that changed on every restart.
+2. A service with no interactive session cannot raise a firewall prompt, so the
+   dynamic port could not be allowed in advance.
+3. Across subnets, 135 is frequently blocked.
+
+With `RpcServerUseProtseqEp` and a fixed endpoint the client names the port
+directly in its string binding, **so the endpoint mapper is never involved and TCP
+135 never has to be open**.
+
+### But the network bottleneck is the call model, not endpoint discovery
+
+A fixed port only solves "cannot connect". What actually hurts over a real network
+is **the number of round trips**. The original interface spent four synchronous
+RPC calls per frame (`RpcBeginImage`, `RpcSendImageChunkData`, `RpcEndImage`,
+`RpcPopEvent`), each waiting for a reply.
+
+Measured inside the container over loopback: **a round trip is only about
+0.6 ms**, so four of them are about 2.4 ms — and the rest of the `send` figure is
+the server's decode. **On loopback this is not a problem.**
+
+But over a real network each round trip also pays the link's RTT:
+
+| Link | RTT | Four round trips per frame |
+|---|---|---|
+| Same machine | ~0 | ~2.4 ms |
+| Same datacentre | 1 ms | ~6 ms |
+| Cross-region | 30 ms | **~126 ms** |
+| Mobile or intercontinental | 80 ms | **~326 ms** |
+
+**Cross-region is unusable, and no amount of dirty rectangles, H.264 or better
+compression fixes it — the cost is per call, not per byte.**
+
+The interface is therefore **one call per frame**: `RpcSendFrame` carries the
+whole frame (or `Size == 0` for none) and the accumulated input events together,
+and the cursor bitmap goes separately through `RpcSetCursorShape` because it
+changes a few times a minute. See the comments in
+`Source/Interface/sandbox.idl`.
+
+> This also fixed a defect in the old interface: the server **dropped frames
+> silently** when the previous one had not been presented yet, and the client had
+> no way to know. `RpcSendFrame`'s return value now distinguishes accepted from
+> dropped, and the profile reports a `dropped by server` count.
 
 ---
 
-## 6. 排错
+## 6. Troubleshooting
 
 ### `Exception 6ba encountered while sending data`
 
-`0x6BA` = `RPC_S_SERVER_UNAVAILABLE`，网络层问题。客户端在第一次真正发起网络调用（`RpcBeginImage`）时才报，说明窗口站初始化和绑定都成功了，纯粹连不上。
+`0x6BA` is `RPC_S_SERVER_UNAVAILABLE`, a network-layer failure. The client reports
+it on its first real network call (`RpcSendFrame`), which means the window station
+setup and the binding both succeeded and it simply cannot reach the server.
 
-按顺序查：
+Check in order:
 
-1. 宿主机 `Get-NetTCPConnection -State Listen -LocalPort 5001` 有没有输出 → 没有就是服务端没起来
-2. 容器里 `Test-NetConnection <宿主机IP> -Port 5001` → False 就是防火墙或路由问题
-3. IP 是否写错 → 见 4.3 的说明
+1. On the host, does `Get-NetTCPConnection -State Listen -LocalPort 5001` return
+   anything? If not, the server is not up.
+2. In the container, `Test-NetConnection <host address> -Port 5001`. False means
+   firewall or routing.
+3. Is the address right? See section 4.3.
 
-注意客户端日志里的 `Done.` **不能证明连通性**：`RpcStringBindingCompose` 和 `RpcBindingFromStringBinding` 都是纯本地操作，真正的连接推迟到第一次调用才建立。
+Note that the client's `Done.` line **does not prove connectivity**:
+`RpcStringBindingCompose` and `RpcBindingFromStringBinding` are purely local, and
+the connection is not made until the first call.
 
-### 画面出来了，鼠标能动，但键盘打字没反应
+### The picture is there and the mouse moves, but typing does nothing
 
-如果按回车、退格、方向键有反应，**只有字母和数字打不出来**，那是宿主机上的**输入法**吃掉了字符键——输入法把字母吞进拼音组字缓冲，控制键原样放行。
+If Enter, Backspace and the arrow keys work but **letters and digits do not**, the
+**host's input method** is swallowing them: an IME takes the character-producing
+keys into its composition buffer and passes control keys through.
 
-宿主机的输入法（如中文拼音）在远端会话上组字本来就没有意义。`Rendering.cpp` 创建窗口后调用了 `SDL_StopTextInput()`，把输入法从窗口上摘掉，让所有物理按键都以原始扫描码到达。
+A host IME has no business composing into a remote session. `Rendering.cpp` calls
+`SDL_StopTextInput()` after creating the window, detaching the IME so every
+physical key arrives as a raw scan code.
 
-如果这行被去掉后问题复现，就是它。
+If the problem comes back, that call is what to check.
 
-### 方向键、Home/End、小键盘回车无效
+### Arrow keys, Home/End and numpad Enter do nothing
 
-宿主侧的 SDL→DIK 扫描码表（`Rendering.cpp` 里的 `scanCodeToKeyNum`）把**扩展键**的高位置 1（`DIK_LEFT = 0xCB`、`DIK_UP = 0xC8`、`DIK_DELETE = 0xD3` 等）。客户端注入前必须剥掉这个标记位并打上 `KEYEVENTF_EXTENDEDKEY`，否则 `SendInput` 认不出扫描码直接丢弃。处理逻辑在 `Client.cpp` 的 `SBET_KeyEvent` 分支。
+The host's SDL-to-DIK table (`scanCodeToKeyNum` in `Rendering.cpp`) sets the high
+bit on **extended keys** (`DIK_LEFT = 0xCB`, `DIK_UP = 0xC8`, `DIK_DELETE = 0xD3`
+and so on). The client has to strip that marker and set `KEYEVENTF_EXTENDEDKEY`
+before injecting, or `SendInput` does not recognise the scan code and discards it.
+The handling is in the `SBET_KeyEvent` branch of `Client.cpp`.
 
-### 状态栏闪烁 / 对话框按钮闪烁
+### The status bar flickers, or dialog buttons do
 
-容器里**没有 DWM**（`tasklist /fi "imagename eq dwm.exe"` 无输出），没有合成器，也就没有可读的屏幕表面。`BitBlt` 读窗口 DC 得到的画面完全不可用（`printwnd.cpp` 里作者的原注释也记录了这点），**`WM_PRINT` 是唯一能拿到像素的途径**。
+There is **no DWM in the container** (`tasklist /fi "imagename eq dwm.exe"`
+returns nothing), so there is no compositor and no screen surface to read.
+`BitBlt` from a window DC produces nothing usable — the original author's comment
+in `printwnd.cpp` records the same finding — and **`WM_PRINT` is the only way to
+get pixels**.
 
-而 `PrintWindow` 的 `PRF_CHILDREN` 那一趟对主题化通用控件不可靠：
+`PrintWindow`'s `PRF_CHILDREN` pass is unreliable for themed common controls:
 
-| 控件 | 现象 | 状态 |
+| Control | Symptom | Status |
 |---|---|---|
-| 状态栏 `msctls_statusbar32` | 只画背景，丢分区和文字 | 已修：`printwnd.cpp` 的 `PrintWindowTree()` 对每个后代显式重打一遍 |
-| 对话框按钮 `Button` | 间歇消失或丢文字，约 12% 的帧 | **未解决**，无 DWM 环境下 `WM_PRINT` 的机制性限制 |
+| Status bar `msctls_statusbar32` | Background only; parts and text missing | Fixed: `PrintWindowTree()` in `printwnd.cpp` re-prints every descendant explicitly |
+| Dialog buttons `Button` | Intermittently blank or missing their text, on about 12% of frames | **Unresolved**; a limitation of `WM_PRINT` with no DWM |
 
-判断某个控件是否受影响：连续抓帧后逐帧比对，变化区域会精确落在该控件矩形内。
+To tell whether a given control is affected, capture a run of frames and diff
+consecutive ones: the changed region lands exactly on that control's rectangle.
 
 ```
-frame018 -> frame019 : 811 px  bbox=(591,572)-(690,599)   ← 正好是 OK 按钮
+frame018 -> frame019 : 811 px  bbox=(591,572)-(690,599)   <- the OK button
 ```
 
-排查时试过但**无效**的方向，避免重复投入：
+Directions that were tried and **did not work**, so they need not be retried:
 
-| 尝试 | 结果 |
+| Attempt | Result |
 |---|---|
-| 清理暂存位图 `ghTempBitmap` | 无效（但消除了脏数据贴图，保留） |
-| 抓屏限帧到 20fps | 对闪烁无效（但显著降 CPU，保留） |
-| `BitBlt` 读窗口 DC | 画面完全不可用 |
-| `PW_RENDERFULLCONTENT` | 无 DWM，不可用 |
-| `RedrawWindow(RDW_UPDATENOW)` + `PrintWindow` | 反而让所有子窗口的 `PrintWindow` 返回失败 |
-| 每个子窗口连打两次 | 无效 |
-| 只重打状态栏类、不动其他控件 | 按钮仍然闪 |
+| Clearing the scratch bitmap `ghTempBitmap` | No effect (but it removed stale-pixel artefacts, so it stayed) |
+| Capping capture at 20 fps | No effect on flicker (but it cut CPU a lot, so it stayed) |
+| `BitBlt` from the window DC | Picture completely unusable |
+| `PW_RENDERFULLCONTENT` | Unusable without DWM |
+| `RedrawWindow(RDW_UPDATENOW)` then `PrintWindow` | Made every child `PrintWindow` fail |
+| Printing each child twice | No effect |
+| Re-printing only status-bar classes | Buttons still flickered |
 
-另外注意 `PrintWindow` 的**返回值不可信**：`PrintWindow failed for child Edit` 会每帧出现，但编辑区画面完全正常。不能拿返回值当判据。
+Also note that **`PrintWindow`'s return value cannot be trusted**:
+`PrintWindow failed for child Edit` appears every frame while the edit control
+renders perfectly.
 
-### 在容器里拖动窗口可以，但鼠标点击没反应
+### Dragging a window works but clicking does nothing
 
-拖动依赖的是移动事件，点击走的是 `MOUSEEVENTF_*DOWN/UP`。定位由 `SetCursorPos` 完成，`SendInput` 里的 `dx/dy` 没有配 `MOUSEEVENTF_ABSOLUTE`，会被忽略——这是预期行为，位置由前者负责。
+Dragging relies on motion events; clicking goes through
+`MOUSEEVENTF_*DOWN/UP`. Positioning is done by `SetCursorPos`, and the `dx`/`dy`
+in `SendInput` are ignored because `MOUSEEVENTF_ABSOLUTE` is not set. That is
+intended: the former is what positions the cursor.
 
 ---
 
-## 7. 调试提示
+## 7. Debug output and switches
 
-客户端 `Client.cpp` 的 `SBET_KeyEvent` 分支里有一行按键日志：
+### SANDBOX_DEBUG
 
-```cpp
-cout << "scan:" << input.ki.wScan << " vk: " << input.ki.wVk << " received" << endl;
+**Neither program prints anything by default.** With `SANDBOX_DEBUG=1` set, the
+client prints a per-second frame profile and the server prints its startup
+progress.
+
+```
+-e SANDBOX_DEBUG=1        # to docker run
+$env:SANDBOX_DEBUG=1      # in host PowerShell
 ```
 
-它在**注入之前**无条件打印，所以能精确区分「事件没到容器」和「到了但注入失败」：
+Everything goes through `Debug()` in `Source/Common/SandboxLog.h`, which discards
+when the variable is unset. That keeps noise out of whatever log collects the
+output when the programs are started by a script, a container runtime or a service
+manager.
 
-| 现象 | 结论 |
-|---|---|
-| 按键没有对应日志 | 宿主侧 SDL 没产生事件，查宿主机输入层 |
-| 有日志但目标程序无反应 | 事件到了，问题在注入侧（前台窗口、UIPI 权限） |
+> Failures are **not** reported by printing. A failure the caller can act on
+> travels as a return value and an exit code (section 4.4), which a script can
+> see and which does not depend on the environment.
 
-验证正常键值参考：
+### The frame profile
 
-| 键 | 日志 |
+With `SANDBOX_DEBUG=1`, the client prints once a second. A frame is split into
+`capture`, `encode` and `send`; `capture` is split into `alloc`, `fills`,
+`windows` and `toGdi+`; `windows` is split into `toplevel` and `child` with
+per-call costs. The last two lines give the capacity answer directly.
+
+What the parts mean, the measured numbers, and the A/B experiments behind the
+current design are in [PERFORMANCE.md](PERFORMANCE.md).
+
+> **Every frame is captured; there is no frame skipping and no capture switches.**
+>
+> Both were built, measured and removed. Skipping when the desktop appeared
+> unchanged needed a change detector, and neither `SetWinEventHook` nor
+> `GetUpdateRect` received anything at all in this container, so the skip
+> degenerated to the one-second resync and the picture updated once a second.
+>
+> The switches that the capture experiments ran behind are gone too — the
+> descendant re-print traded 1.1 ms for flicker, and the bare `WM_PRINT` variant
+> produced an empty picture. [PERFORMANCE.md](PERFORMANCE.md) sections 3 and 4
+> keep the measurements.
+>
+> The cost of capturing every frame is known and fixed: **30 fps of capture is
+> about 30% of one core, or roughly 3 containers per core**, with no heuristics
+> involved.
+
+### Measuring
+
+Costs vary enough between window contents that measuring only one case gives the
+wrong answer:
+
+| Scene | `PrintWindow calls per frame` | Notes |
+|---|---|---|
+| Empty desktop | 1 | The floor |
+| `cmd.exe` console | 1 | The cost of one full-screen window |
+| **A dialog with a dozen children** | **~15** | **The ceiling**; open a property sheet with `rundll32` |
+
+### Debugging key injection
+
+A `cout << "scan:..."` line used to sit in the `SBET_KeyEvent` branch and was
+removed once the values had been checked. To bring it back temporarily, add it to
+the `SBET_KeyEvent` branch of `ApplyInputEvent`:
+
+| Key | Log |
 |---|---|
 | A | `scan:30 vk: 65` |
 | Enter | `scan:28 vk: 13` |
-| 左方向键 | `scan:75 vk: 37`（0xCB 剥掉高位后为 0x4B） |
-
-确认无误后可以删掉这行，避免每个按键都刷屏。
+| Left arrow | `scan:75 vk: 37` (0x4B once 0xCB's high bit is stripped) |
 
 ---
 
-## 8. 已知限制
+## 8. Known limitations
 
-- **无认证**：服务端以 `RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH` 注册，任何能连上 5001 端口的主机都可以读取画面并注入输入。仅适合可信网络中的 POC 使用。
-- **对话框按钮会闪烁**：容器无 DWM，`WM_PRINT` 对主题化控件支持不完整。状态栏已通过显式重打后代修复，按钮未解决，详见第 6 节。
-- **单会话**：服务端状态（`Rendering.cpp` 的位图缓冲、纹理、事件队列）都是全局单例，同一时刻只能服务一个容器。
-- **抓屏有帧率上限**：客户端循环按 `Client.cpp` 的 `FrameIntervalMs` 节流，当前 33 ms（~30fps）。这个值是拿容器 CPU 换流畅度的旋钮。
-- **每帧全屏 PNG**：客户端用 GDI+ 把整屏编码成 PNG，服务端再用 `IMG_LoadPNG_RW` 解码。实测编码约 6.9 ms / 1024×768 帧，占 33 ms 帧预算的 21%，**不是主要开销**；换成 WIC 反而慢 1.8 倍。真正的浪费在于 81% 的相邻帧完全相同却仍然整屏重编码重传输，见 [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md) 第 2、3 节。
-- **NAT 抹平源 IP**：容器流量经 docker NAT 后，服务端看到的所有连接源地址都是宿主机地址，无法用 IP 区分容器。
-- **没有音频**：容器里没有任何音频端点（`waveOutGetNumDevs()` 返回 0），也没有可抓的流。要做得在用户态伪造端点，成本是另起一个项目。详见 [AUDIO.md](AUDIO.md)。
+- **No authentication.** The server registers with
+  `RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH`, so anything that can reach port 5001 can
+  read the picture and inject input. Suitable for a trusted network only.
+- **Dialog buttons flicker.** With no DWM, `WM_PRINT` does not fully support
+  themed controls. Status bars are fixed by re-printing descendants; buttons are
+  not. Turning the descendant re-print off saves about 1.1 ms and brings the
+  flicker back, so it is a trade rather than a saving.
+- **One session.** The server's state — texture, cursor, event queue — is global,
+  so it serves one container at a time. Serving several means moving that state
+  into a per-session structure.
+- **Frame rate.** `FrameIntervalMs` in `Client.cpp` is 33 ms (~30 fps), paced by a
+  high-resolution waitable timer. Measured frame time is 35–39 ms; the remainder
+  is scheduling latency in the VM.
+- **Capacity: about 3 containers per core on an idle desktop, about 1 with a
+  dialog open.** The window pass is the largest cost and is close to the real
+  cost of painting the tree, so there is nothing redundant to remove; the only
+  lever left is capturing less often, which was tried and did not work here.
+  Numbers and experiments in [PERFORMANCE.md](PERFORMANCE.md).
+- **The client blocks on the server's decode.** `RpcSendFrame` is synchronous and
+  the server finishes decoding the PNG and uploading the texture before replying
+  (about 4.9 ms measured). With several containers, a busy server stalls all of
+  them.
+- **NAT hides the source address.** Docker's NAT rewrites container traffic, so
+  the server sees every connection coming from the host and cannot tell containers
+  apart by address.
+- **No audio.** Containers have no audio endpoint and no stream to capture; see
+  [AUDIO.md](AUDIO.md).
+- **`IMAGE-ANALYSIS.md` was written against `servercore:20H2`**, while the project
+  now uses `windows/server:ltsc2025`. The two differ substantially. That document
+  opens with a correction.

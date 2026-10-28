@@ -9,20 +9,43 @@ import "ocidl.idl";
 
 interface Sandbox
 {
-	void RpcBeginImage(
+	// One frame, one round trip, plus whatever input accumulated since the last
+	// one.
+	//
+	// Size == 0 means "no frame this time, just deliver the input": the caller
+	// still gets its events, which is what keeps a static screen responsive.
+	//
+	// EventCount is the caller's buffer capacity on the way in and the number of
+	// events written on the way out, so only the filled prefix of Events is
+	// transmitted.
+	//
+	// Return value: 0 if the frame was accepted for presentation, 1 if it was
+	// dropped because the previous one has not been presented yet.
+	unsigned long RpcSendFrame(
 		[in] unsigned long Width,
 		[in] unsigned long Height,
-		[in] unsigned long Size
+		[in] unsigned long Size,
+		[in, size_is(Size), length_is(Size)] const unsigned char BitmapData[*],
+		[in] long CursorX,
+		[in] long CursorY,
+		[in] unsigned long CursorVisible,
+		[in, out] unsigned long* EventCount,
+		[out, size_is(*EventCount), length_is(*EventCount)] struct SandboxEvent Events[*]
 	);
 
-	void RpcSendImageChunkData(
-		[in] unsigned long BitmapSize,
-		[in, size_is(BitmapSize), length_is(BitmapSize)] const unsigned char BitmapData[*]
+	// The cursor bitmap, sent only when the shape changes.
+	//
+	// The cursor is not drawn into the frame -- the host composites it -- so
+	// moving the mouse does not dirty the pixels underneath it.
+	//
+	// Pixels is 32bpp BGRA, top-down, straight alpha. The host draws it at
+	// (CursorX - HotX, CursorY - HotY).
+	void RpcSetCursorShape(
+		[in] unsigned long Width,
+		[in] unsigned long Height,
+		[in] unsigned long HotX,
+		[in] unsigned long HotY,
+		[in] unsigned long Size,
+		[in, size_is(Size), length_is(Size)] const unsigned char Pixels[*]
 	);
-
-	void RpcEndImage();
-
-	boolean RpcPopEvent(
-		[out, ref] struct SandboxEvent* Event
-	);
-}
+};

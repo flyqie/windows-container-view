@@ -2,11 +2,17 @@
 #include "ServerPrivate.h"
 #include <rpc.h>
 #include "../Interface/sandbox_h.h"
-#include "../Interface/SandboxConfig.h"
+#include "../Common/SandboxEnv.h"
 
 void SandboxInitServer()
 {
 	RPC_STATUS Status;
+
+	// Port from SANDBOX_PORT, defaulting to the compiled value; see SandboxEnv.
+	// Both sides read the same variable, so they only agree if it is set for
+	// both -- the container's environment for the client, the host's for the
+	// server.
+	const wchar_t* Port = SandboxPort();
 
 	// Fixed endpoint instead of a dynamic one. The client names the same port
 	// in its string binding and connects directly, so no endpoint mapper
@@ -14,7 +20,7 @@ void SandboxInitServer()
 	Status = RpcServerUseProtseqEp(
 		(RPC_WSTR)TEXT("ncacn_ip_tcp"),
 		RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
-		(RPC_WSTR)SANDBOX_RPC_ENDPOINT,
+		(RPC_WSTR)Port,
 		NULL
 	);
 
@@ -54,24 +60,7 @@ void SandboxInitServer()
 	}
 }
 
-void SANDBOXSERVER_API SandboxInitVideo()
+void SandboxInitVideo()
 {
 	InitVideo();
 }
-
-/*
-void SANDBOXSERVER_API SandboxSetBeginImageTransmission(OnBeginImageTransmission Function)
-{
-	BeginImageTransmission = Function;
-}
-
-void SANDBOXSERVER_API SandboxSetReceivedImageData(OnReceivedImageData Function)
-{
-	ReceivedImageData = Function;
-}
-
-void SANDBOXSERVER_API SandboxSetEndImageTransmission(OnEndImageTransmission Function)
-{
-	EndImageTransmission = Function;
-}
-*/

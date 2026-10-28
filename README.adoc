@@ -1,50 +1,137 @@
 = Windows Container View
 
-This tool allows anyone to view and control the graphical user interface of a Windows Container.
+View and control the graphical user interface of a Windows container.
 
 image::Docs/screenshot.png[]
 
+A Windows container has no display adapter, so a GUI application running in one
+has nowhere to draw. This tool gives it somewhere: the client, running inside the
+container, builds a window station and desktop, paints every window into a bitmap
+through `WM_PRINT`, and sends the result over RPC to a server on the host, which
+displays it in an SDL window and sends mouse and keyboard input back.
+
+It is for **process-isolated containers only** (`--isolation process`).
+
 == Requirements
 
-- Visual Studio 2019
-- SDL2
-- Docker (at the time of writing, it's the only software that can spawn Hyper-V Containers and Server Silos)
+* Windows 10 or later, or Windows Server, x64
+* Visual Studio 2019 or later, with the Desktop development with C++ workload
+* Docker, to run the container
 
-Just build the solution.
+Building produces two programs, `Sandbox-Server.exe` and `Sandbox-Client.exe`.
+
+== Building
+
+Open `Sandbox.sln` and build `Release|x64`, or from a command line:
+
+[source,powershell]
+----
+msbuild Sandbox.sln /p:Configuration=Release /p:Platform=x64 /t:Build /m
+----
+
+Both land in `Output\x64\Release\`. `Sandbox-Server.exe` needs `SDL2.dll` and
+`SDL2_image.dll` beside it, which the build copies. `Sandbox-Client.exe` needs
+nothing but system DLLs.
 
 == Running
 
-. Run sandbox.exe on your host computer, a white window should appear, waiting for the client connection.
+. Run `Sandbox-Server.exe` on the host. A window appears and waits for the
+client. It takes no arguments.
 
-. Run a container by mounting a directory to the output executable path (including SDL2.dll). The container must execute the Sandbox executable with the "client" arguments, following by the host IP address, i.e: `C:\Sandbox\Sandbox.exe client 192.168.1.50`. The minimal requirement for the image is server core. Nano server won't work because it strips Win32K (graphical user interface). The container can run with process and hyper-v isolation.
+. Run a container with `Sandbox-Client.exe` mounted into it. The host address
+comes from `SANDBOX_HOST`; the port defaults to 5001 and can be changed with
+`SANDBOX_PORT`.
 
-. The sandbox running on your host computer should now display the container's GUI, with a console window in it. Programs (like Process Explorer or Process Hacker) can be started from it.
++
+[source]
+----
+docker run --rm -ti --isolation process ^
+  -e SANDBOX_HOST=192.168.1.50 ^
+  -v C:\path\to\Sandbox-Client.exe:C:\Sandbox\Sandbox-Client.exe:ro ^
+  mcr.microsoft.com/windows/servercore:ltsc2025 ^
+  C:\Sandbox\Sandbox-Client.exe
+----
 
-Example:
-```
-docker run --rm -ti --isolation process -v D:\Sources\Sandbox\Output\x64\Release:C:\Sandbox:ro -v "D:\Tools\ProcessHacker":C:\ProcessHacker mcr.microsoft.com/windows/servercore:20H2 C:\Sandbox\Sandbox client 192.168.1.50
-```
+. The window on the host shows the container's desktop.
+
+`SANDBOX_HOST` is an address of the machine running `Sandbox-Server.exe` that the
+container can reach: the container's default gateway if both are on the same
+machine, or the host's address on a network the container can see.
+
+The image must be **Server Core** or later; Nano Server removes Win32k and cannot
+create windows. Its build must match the host's, or process isolation will refuse
+to start.
+
+=== Choosing what to run
+
+Anything after the program name is started on the container's desktop. With
+nothing, `cmd.exe` is started:
+
+[source]
+----
+C:\Sandbox\Sandbox-Client.exe notepad.exe
+C:\Sandbox\Sandbox-Client.exe "C:\Program Files\App\app.exe"
+----
+
+=== Output
+
+Neither program prints anything by default. Set `SANDBOX_DEBUG=1` on either side
+to see what it is doing; the client then prints a per-second breakdown of where
+each frame's time goes.
 
 == How it works
 
-The program uses the PrintWindow() API on each window to write their visual into a Device Context. PrintWindow() only works for windows inside a window station that allows I/O, which is WinSta0, otherwise the output result is black.
+`PrintWindow()` writes a window's appearance into a device context, but only for
+windows on a window station that allows I/O — `WinSta0`. Anywhere else the result
+is black. Container processes start on the service window station
+(`Service-0x0-xxx$`), where the access rights are also too low to switch desktop
+or create windows at all.
 
-By default, applications are assigned to the service window station (Service-0x0-xxx$). Access rights are insufficient to assign ourselves to WinSta0, switch desktop and create windows. The console container must belong to a desktop inside WinSta0 to be able to send input.
+So the client, before doing anything else:
 
-. The program sets all access rights for everyone on the WinSta0 window station, and the WinSta0\Default desktop object.
-. It assigns itself to WinSta0, and set its thread's desktop to WinSta0\Default.
-. It switches the console container to the WinSta0\Default desktop, so input will work.
-. After initializing, it prints individual windows into a bitmap buffer which will be sent over the network to the sandbox server, using RPC.
+. Grants everyone full access to the `WinSta0` window station and the
+`WinSta0\Default` desktop.
+. Assigns itself to `WinSta0` and sets its thread's desktop to `WinSta0\Default`.
+. Starts the requested program on that desktop, so its windows are ones the
+client can see and send input to.
+
+From then on it loops: paint every window into one bitmap, encode it as PNG, and
+send it to the host in a single RPC call that also carries back whatever input
+arrived. Frames whose pixels are identical to the previous one are not sent.
+
+The cursor is not painted into that bitmap. It travels separately and the host
+composites it, because a cursor baked into the frame makes the pixels underneath
+it dirty every time the mouse moves.
+
+== Known limitations
+
+* **No authentication.** The server registers with
+  `RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH`, so anything that can reach the port can
+  read the picture and inject input. Suitable for a trusted network only.
+* **One session at a time.** The server's state — texture, cursor, event queue —
+  is global.
+* **Themes draw imperfectly.** With no DWM in the container, `WM_PRINT` does not
+  fully support themed controls. Status bars are handled by re-printing each
+  descendant; dialog buttons still flicker on a fraction of frames.
+* **Capacity.** About 30% of one core per container on an idle desktop, and about
+  one core with a dialog open.
+* **No audio.** Containers have no audio endpoint and no stream to capture.
+* **NAT hides the source address.** Docker's NAT rewrites container traffic, so
+  the server cannot tell containers apart by address.
 
 == Epilogue
 
-This program is for educational/research purposes. It is a POC that even if a container is headless, visual information can be retrieved.
+This is a proof of concept, for educational and research purposes: even a headless
+container can be made to yield visual information.
 
-Examples of use cases where this technique can be used:
+Use cases it fits:
 
-- To allow IT administrators to install programs in a container that require user interaction (like using the GUI installer from a software, and entering the license key), and export the container when finished.
-- It can also be used to navigate to the host session 0 for services that require user interaction.
-- It can be used to test suspicious program in a lightweight Sandbox (it works in an Hyper-V container)
-- It could be used in conjunction with a sandbox technology that let users easily spawn processes inside one or more sandboxes (Server Silo, or Hyper-V container) and retrieve their visual output like Windows Defender Application Guard for Microsoft Edge. A Server Silo, even if less secure, has the advantage of being faster than a VM (uses the host kernel), and has the advantage of being able to forward devices easier.
+* Installing software in a container that needs a user to click through it —
+  a GUI installer, a licence key — and exporting the container afterwards.
+* Driving a service that requires user interaction through session 0.
+* Testing a suspicious program in a lightweight sandbox.
+* Serving as the display half of a sandbox technology that spawns processes in
+  Server Silos and retrieves their output, the way Windows Defender Application
+  Guard does for Edge.
 
 image::Docs/container_about.png[]

@@ -100,23 +100,26 @@ extern RPC_IF_HANDLE __MIDL_itf_sandbox_0000_0000_v0_0_s_ifspec;
 /* interface Sandbox */
 /* [version][uuid] */ 
 
-void RpcBeginImage( 
+unsigned long RpcSendFrame( 
     /* [in] */ handle_t IDL_handle,
     /* [in] */ unsigned long Width,
     /* [in] */ unsigned long Height,
-    /* [in] */ unsigned long Size);
+    /* [in] */ unsigned long Size,
+    /* [length_is][size_is][in] */ const unsigned char BitmapData[  ],
+    /* [in] */ long CursorX,
+    /* [in] */ long CursorY,
+    /* [in] */ unsigned long CursorVisible,
+    /* [out][in] */ unsigned long *EventCount,
+    /* [length_is][size_is][out] */ struct SandboxEvent Events[  ]);
 
-void RpcSendImageChunkData( 
+void RpcSetCursorShape( 
     /* [in] */ handle_t IDL_handle,
-    /* [in] */ unsigned long BitmapSize,
-    /* [length_is][size_is][in] */ const unsigned char BitmapData[  ]);
-
-void RpcEndImage( 
-    /* [in] */ handle_t IDL_handle);
-
-boolean RpcPopEvent( 
-    /* [in] */ handle_t IDL_handle,
-    /* [ref][out] */ struct SandboxEvent *Event);
+    /* [in] */ unsigned long Width,
+    /* [in] */ unsigned long Height,
+    /* [in] */ unsigned long HotX,
+    /* [in] */ unsigned long HotY,
+    /* [in] */ unsigned long Size,
+    /* [length_is][size_is][in] */ const unsigned char Pixels[  ]);
 
 
 

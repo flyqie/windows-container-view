@@ -1,61 +1,69 @@
-# 在 Windows 进程隔离容器里运行 RDP 服务端：根因定位
+# Running an RDP server in a Windows process-isolated container: root cause
 
-> 结论先说：**进程隔离容器的对象命名空间里没有 PnP 枚举出来的匿名设备对象**，
-> 而 RDP 服务端的输入栈要打开 UMBus 的设备接口。打不开 → `ERROR_FILE_NOT_FOUND`。
-> 这是容器边界，镜像、DLL、注册表都改不了。
+> The short version: **a process-isolated container's object namespace does not
+> contain the anonymous device objects that PnP enumerates**, and the RDP server's
+> input stack has to open a UMBus device interface. It cannot, so it gets
+> `ERROR_FILE_NOT_FOUND`. This is a container boundary — the image, the DLLs and
+> the registry cannot change it.
 
-本文记录一条完整的定位路径，每一步都附上排除掉的假设和排除它的实验。
-如果你在排查"容器里某个设备/驱动相关的东西不工作"，这套方法可以直接复用。
+This is a complete trace of how that was established, with each discarded
+hypothesis and the experiment that discarded it. The method transfers directly to
+any "something device- or driver-related does not work in a container" problem.
 
 ---
 
-## 1. 现象
+## 1. Symptom
 
-在 `mcr.microsoft.com/windows/servercore:20H2` 容器里（`--isolation process`）启动
-TermService 之后：
+In a `mcr.microsoft.com/windows/servercore:20H2` container (`--isolation process`),
+after starting TermService:
 
-- 3389 完全不监听，事件日志里没有任何错误
-- 加上一组二进制补丁之后 3389 能监听，但客户端连上去**卡在"正在配置远程会话"**
-  约 20 秒后断开，服务端 `qwinsta` 里会话一闪而过
+- 3389 does not listen at all, and the event log says nothing.
+- With a set of binary patches applied, 3389 listens, but a client connecting
+  **hangs at "configuring the remote session"** and disconnects after about 20
+  seconds. On the server, `qwinsta` shows a session that flashes past.
 
-## 2. 环境
+## 2. Environment
 
 | | |
 |---|---|
-| 宿主 | Windows Server, version 20H2（Build 19042） |
-| 容器 | `mcr.microsoft.com/windows/servercore:20H2`，`isolation=process` |
-| 镜像层 | base 层 2020-09-11 + CU 层 2022-08-05 |
-| 客户端 | Windows 10 上的 `mstsc` |
+| Host | Windows Server, version 20H2 (build 19042) |
+| Container | `mcr.microsoft.com/windows/servercore:20H2`, `isolation=process` |
+| Image layers | base 2020-09-11 + cumulative update 2022-08-05 |
+| Client | `mstsc` on Windows 10 |
 
-**关键前提**：进程隔离容器共享宿主内核，内核驱动来自宿主。
+**The key premise**: a process-isolated container shares the host kernel, so its
+kernel drivers are the host's.
 
 ---
 
-## 3. 第一道封锁：容器检测
+## 3. First barrier: the container check
 
-`termsrv.dll` 里创建监听器的路径上有一个容器检测：检测到容器就直接放弃，
-返回 `ERROR_FILE_NOT_FOUND`，**日志里什么都不写**。
+`termsrv.dll` checks for a container on the listener-creation path. Detecting one
+abandons the attempt and returns `ERROR_FILE_NOT_FOUND`, **writing nothing to any
+log**.
 
-反编译出来是：
+Decompiled, the check reads:
 
 ```c
 RegQueryValueExW(hKey, L"TemporaryALiC", ...);   // HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server
 ```
 
-**非 0 时容器检测直接返回 0**，封锁解除。名字是 "Temporary **A**llow **Li**stener in **C**ontainer"，
-微软自己留的测试开关。
+**When it is non-zero the container check returns 0** and the barrier is gone.
+The name is "Temporary **A**llow **Li**stener in **C**ontainer" — a test switch
+Microsoft left in.
 
 ```cmd
 reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v TemporaryALiC /t REG_DWORD /d 1 /f
 ```
 
-设了之后这道封锁确实解除（这是 2018 年 Rafael Rivera 那篇文章里的机制，**至今仍然有效**）。
+With it set, the barrier really is lifted. This is the mechanism from Rafael
+Rivera's 2018 article, **and it still works**.
 
 ---
 
-## 4. 第二道：监听器仍然起不来
+## 4. Second barrier: the listener still does not start
 
-解除第一道封锁后，抓 `termsrv` 的 WPP 输出能看到：
+With the first barrier lifted, capturing `termsrv`'s WPP output shows:
 
 ```
 :Listener RDP-Tcp terminal class (null)
@@ -66,30 +74,33 @@ ERR::ptrProtocolMgr->Initialize failed: 0x80070002 in CProtocolExMgr::CreateList
 ERR::No listeners
 ```
 
-### 怎么打开这些输出
+### How to see that output
 
-`_DbgPrintMessage` 默认三条出口全关（ETW provider Level 为 0、`g_bDebugSpew` 硬编码为 0、
-内存环形缓冲没有读取者）。要看到它必须主动开 ETW 会话：
+`_DbgPrintMessage` has all three of its exits closed by default (the ETW provider
+level is 0, `g_bDebugSpew` is hard-coded to 0, and nothing reads the in-memory ring
+buffer). Seeing it requires starting an ETW session:
 
 ```powershell
-# DebugFlags/DebugLevel 由 CWPPLoggerGuidConfig::ReadTraceConfig 读取
+# DebugFlags/DebugLevel are read by CWPPLoggerGuidConfig::ReadTraceConfig
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name Debug      -PropertyType DWord -Value 1          -Force
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name DebugFlags -PropertyType DWord -Value 0xFFFFFFFF -Force
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name DebugLevel -PropertyType DWord -Value 0xFFFFFFFF -Force
 
-# 注意 level 是 UCHAR(0-255)，写 0xFFFFFFFF 会报 "Out of present range."
+# Note the level is a UCHAR (0-255); 0xFFFFFFFF reports "Out of present range."
 logman start WcvS1 -p '{5283D5F6-65B5-425F-A30B-F16C057D6B57}' 0xFFFFFFFF 255 -o C:\s1.etl -ets
 ```
 
-**WPP provider GUID 的编码**：符号名 `WPP_<32hex>_Traceguids` 里的 hex **就是 GUID 的字符串形式**，
-按 `8-4-4-4-12` 插横线即可。**不要再用 `bytes_le` 转一次**——那是双重翻转，
-会让你找错 provider（我们为此浪费了一轮：抓到 0 事件，因为选的 GUID 属于
-`CUMRDPListenerVMBus`，和卡点无关）。
+**Encoding a WPP provider GUID**: the hex in a symbol name
+`WPP_<32hex>_Traceguids` **is the GUID's string form** — insert the hyphens as
+`8-4-4-4-12`. **Do not run it through `bytes_le` as well**; that reverses it twice
+and lands on the wrong provider. (That mistake cost a round: zero events captured,
+because the chosen GUID belonged to `CUMRDPListenerVMBus`, which has nothing to do
+with the failure.)
 
-### 顺着 0x80070002 往下
+### Following `0x80070002` down
 
-`0x80070002` = `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`，它从
-`CUMRDPProtocolManager::FinalConstruct` 原样透传出来：
+`0x80070002` is `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`, passed through
+unchanged from `CUMRDPProtocolManager::FinalConstruct`:
 
 ```
 termsrv  CProtocolManager::Initialize
@@ -98,32 +109,34 @@ termsrv  CProtocolManager::Initialize
             └─ CTiBus::Initialize(L"TERMINPUT_BUS")
                  └─ CTiBus::SetupDevice(this, this, L"TERMINPUT_BUS", ...)
                       └─ umb.dll!CUMBusDriver::AddBusEnumerator
-                           ├─ CUMBusDeviceInterface::OpenRootUmBusEnumerator   ← 就是这里失败
+                           ├─ CUMBusDeviceInterface::OpenRootUmBusEnumerator   <- fails here
                            └─ CUMBusDriver::CreateBusEnumerator
                                 └─ DeviceIoControl(hUMBus, 0x228000, <DWORD 1><L"TERMINPUT_BUS">, ...)
 ```
 
-`CTiBus::Initialize` 有四个失败点，只有 `OpenRootUmBusEnumerator` / `CreateBusEnumerator`
-这条能产出 `0x80070002`（`CreateBusEnumerator` 里失败路径是
-`GetLastError() | 0x80070000`，`GetLastError()==2` 正好得到这个值）。
+`CTiBus::Initialize` has four failure points, and only the
+`OpenRootUmBusEnumerator` / `CreateBusEnumerator` path can produce `0x80070002`
+(the failure path inside `CreateBusEnumerator` is `GetLastError() | 0x80070000`,
+and `GetLastError() == 2` gives exactly that).
 
-### 临时绕过（仅为继续分析，不是修复）
+### A temporary bypass (to keep analysing, not a fix)
 
-在 `FinalConstruct` 里让 `CTiBus::Initialize` 的失败被忽略，监听器就能起来：
+Letting `FinalConstruct` ignore `CTiBus::Initialize`'s failure gets the listener up:
 
 ```
-rdpcorets.dll 文件偏移 0x16617   8b f0  (mov esi,eax)   ->  31 f6  (xor esi,esi)
-rdpcorets.dll 文件偏移 0x16619   85 c0  (test eax,eax)  ->  31 c0  (xor eax,eax)
+rdpcorets.dll file offset 0x16617   8b f0  (mov esi,eax)   ->  31 f6  (xor esi,esi)
+rdpcorets.dll file offset 0x16619   85 c0  (test eax,eax)  ->  31 c0  (xor eax,eax)
 ```
 
-打完之后 3389 开始监听、`qwinsta` 出现 `rdp-tcp 65536 Listen`、会话也能创建
-（`csrss` 起来、`CsrConnected` 达成）。
+With those, 3389 listens, `qwinsta` shows `rdp-tcp 65536 Listen`, and sessions can
+be created (`csrss` starts, `CsrConnected` is reached).
 
 ---
 
-## 5. 第三道：会话卡在"正在配置远程会话"
+## 5. Third barrier: the session hangs at "configuring the remote session"
 
-客户端连上后卡约 20 秒然后断开。`termsrv` 的 WPP 输出：
+A client connects, hangs for about 20 seconds and disconnects. `termsrv`'s WPP
+output:
 
 ```
 [termsrv] :Assign session id 33 to terminal Trace ID 0x35
@@ -131,8 +144,8 @@ rdpcorets.dll 文件偏移 0x16619   85 c0  (test eax,eax)  ->  31 c0  (xor eax,
 [termsrv] ERR::AssignSession failed: 0x80070102 in CRemoteTerminal::DoConnect
 ```
 
-`0x80070102` = `HRESULT_FROM_WIN32(258 /*WAIT_TIMEOUT*/)`。它在 `rdpcorets.dll` 里
-**只有一个产出点**，而且是个字面量：
+`0x80070102` is `HRESULT_FROM_WIN32(258 /*WAIT_TIMEOUT*/)`. In `rdpcorets.dll` it
+has **exactly one producer**, and it is a literal:
 
 ```c
 __int64 __fastcall CTiDevice::WaitForDeviceReady(HANDLE *this)
@@ -148,7 +161,7 @@ __int64 __fastcall CTiDevice::WaitForDeviceReady(HANDLE *this)
 }
 ```
 
-调用链：
+The call chain:
 
 ```
 CUMRDPConnection::NotifySessionId
@@ -156,203 +169,231 @@ CUMRDPConnection::NotifySessionId
        └─ CTiDevice::WaitForDeviceReady
 ```
 
-那个"设备就绪事件"由 `CTiDevice::Initialize` 里 `CreateEventW` 创建，
-**只在 `CTiBus::SetupDevice` 的成功路径上**由 `CTiDevice::SignalReady` 置位。
+That "device ready" event is created by `CreateEventW` in `CTiDevice::Initialize`
+and is **only ever signalled by `CTiDevice::SignalReady`, on `CTiBus::SetupDevice`'s
+success path**.
 
-**所以两道门是同一个根因**：`CTiBus` 建不起来，导致
-①监听器创建阶段 `FinalConstruct` 失败；②会话建立阶段设备就绪事件永远不置位。
+**So both barriers have one root cause**: `CTiBus` cannot be built, which (1) fails
+`FinalConstruct` during listener creation and (2) leaves the device-ready event
+unsignalled during session setup.
 
 ---
 
-## 6. 排除"二进制版本差异"
+## 6. Ruling out a binary version difference
 
-一开始的假设是"微软更新镜像换了 `rdpcorets.dll`"。**这个假设是错的，但排除它的实验很值得做。**
+The first hypothesis was that a Microsoft image update had changed
+`rdpcorets.dll`. **It was wrong, but the experiment that ruled it out was worth
+doing.**
 
-关键发现：**宿主机的 `rdpcorets.dll` 和 `umb.dll` 与镜像 base 层那两份逐字节相同**：
+The key finding: **the host's `rdpcorets.dll` and `umb.dll` are byte-for-byte
+identical to the ones in the image's base layer**:
 
-| 文件 | 宿主机 | 20H2 base 层 | 20H2 CU 层 |
+| File | Host | 20H2 base layer | 20H2 CU layer |
 |---|---|---|---|
 | `rdpcorets.dll` | 1611776 · `802AD462…` | **1611776 · `802AD462…`** | 1639936 · `5C14BFA2…` |
 | `umb.dll` | 78848 · `E28A994E…` | **78848 · `E28A994E…`** | 78848 · `A0EE4FA8…` |
 
-也就是说这台 VM 宿主是 Server 20H2，服务级别和镜像 base 层一致，**宿主的 RDP 是好的**。
+The host is Server 20H2, at the same servicing level as the image's base layer, and
+**RDP works on it**.
 
-于是做**交换实验**：把宿主机那两份（能跑的）覆盖进容器层，覆盖掉 CU 层那两份。
+So the experiment was to **swap**: copy the host's working pair over the container's
+CU-layer copies.
 
 ```powershell
-# 见 Tools/Swap-UmbStack-ToHost.ps1
-docker stop <容器>
-.\Swap-UmbStack-ToHost.ps1 -Apply      # 需要先 takeown + icacls，windowsfilter 层是 ACL 问题
-docker start <容器>
+# See Tools/Swap-UmbStack-ToHost.ps1
+docker stop <container>
+.\Swap-UmbStack-ToHost.ps1 -Apply      # needs takeown + icacls first; windowsfilter layers are an ACL problem
+docker start <container>
 ```
 
-结果：
+Result:
 
 ```
-rdpcorets.dll  1611776   ← 和宿主机逐字节相同，无补丁
-umb.dll          78848   ← 和宿主机逐字节相同
+rdpcorets.dll  1611776   <- byte-identical to the host, unpatched
+umb.dll          78848   <- byte-identical to the host
 TermService    Running
-3389           没监听
+3389           not listening
 ```
 
-**同一份二进制，宿主好、容器坏。DLL 版本差异被彻底排除。**
+**The same binaries work on the host and fail in the container. A DLL version
+difference is conclusively ruled out.**
 
-> 顺带一个结论：静态比对本身没错（`SetupDevice` 在 base 和 CU 之间逐字节相同，
-> `CTiBus::Initialize` 调用序列相同，`AddBusEnumerator` 结构相同），
-> 但**方向是错的**——变量根本不在 DLL 里。
+> A side note: the static comparison itself was not wrong (`SetupDevice` is
+> byte-identical between base and CU, the `CTiBus::Initialize` call sequence is the
+> same, `AddBusEnumerator` is structurally the same). **The direction was wrong** —
+> the variable was never in the DLLs.
 
 ---
 
-## 7. 根因：容器对象命名空间
+## 7. Root cause: the container's object namespace
 
-用一个**纯 Win32** 的探针（`Tools/Probe-UMBus.c`，不调 `umb.dll`、不用虚表）在宿主和容器各跑一遍：
+A **pure Win32** probe (`Tools/Probe-UMBus.c` — it does not call `umb.dll` and does
+not use its vtables) was run on the host and in the container:
 
-| 探针 | 宿主机 | 容器 |
+| Probe | Host | Container |
 |---|---|---|
 | `[1]` `SetupDiGetClassDevs` | OK | **OK** |
 | `[1]` `CreateFileW` `\\?\root#umbus#0000#{65a9a6cf-…}` | **OK** | **FAILED: 2** |
 | `[1]` `CreateFileW` `\\?\umb#umb#1&841921d&0&terminput_bus#{…}` | **OK** | **FAILED: 2** |
-| `[2]` `QueryDosDeviceW("root#umbus#0000#{…}")` | **→ `\Device\00000008`** | **NOT IN THIS NAMESPACE: 2** |
-| `[2]` `QueryDosDeviceW("umb#umb#1&841921d&0&terminput_bus#{…}")` | **→ `\Device\00000077`** | **NOT IN THIS NAMESPACE: 2** |
+| `[2]` `QueryDosDeviceW("root#umbus#0000#{…}")` | **-> `\Device\00000008`** | **NOT IN THIS NAMESPACE: 2** |
+| `[2]` `QueryDosDeviceW("umb#umb#1&841921d&0&terminput_bus#{…}")` | **-> `\Device\00000077`** | **NOT IN THIS NAMESPACE: 2** |
 | `[3]` `CreateFileW` `\\?\GLOBALROOT\Device\00000008` | **OK** | — |
-| `[4]` 扫 `\Device\00000000`–`\Device\000000FF`（0 访问权限打开） | **32 of 256 打开** | **0 of 256 打开** |
-| `[5]` **对照**：`\\?\GLOBALROOT\Device\KsecDD` / `\Device\Null` | OK | **OK** |
+| `[4]` scan `\Device\00000000`–`\Device\000000FF` (open with no access) | **32 of 256 opened** | **0 of 256 opened** |
+| `[5]` **control**: `\\?\GLOBALROOT\Device\KsecDD` / `\Device\Null` | OK | **OK** |
 
-### `[5]` 是对照组，很重要
+### `[5]` is the control, and it matters
 
-它排除了"`\\?\GLOBALROOT` 这种路径形式在容器里不解析"这个假阴性。
-容器里 `KsecDD` 和 `Null` 都开得到，**所以 `[4]` 的 `0 of 256` 是真的**。
+It rules out the false negative that `\\?\GLOBALROOT` paths simply do not resolve
+in a container. `KsecDD` and `Null` both open there, **so `[4]`'s `0 of 256` is
+real**.
 
-### 怎么读这张表
+### Reading the table
 
-- **`SetupDiGetClassDevs` 在容器里成功** —— PnP 设备数据库（`Enum`）容器看得见，
-  `ROOT\UMBUS\0000` 状态 Started、`umbus` 驱动 RUNNING
-- **但匿名设备对象 `\Device\000000NN` 一个都开不到** —— 容器里连它们都不存在
-- **接口符号链接 `\??\root#umbus#0000#{…}` 也不在容器的命名空间里**
+- **`SetupDiGetClassDevs` succeeds in the container** — the PnP device database
+  (`Enum`) is visible, `ROOT\UMBUS\0000` is Started, and the `umbus` driver is
+  RUNNING.
+- **But not one anonymous device object `\Device\000000NN` can be opened** — they
+  do not exist in the container at all.
+- **Nor is the interface symbolic link `\??\root#umbus#0000#{…}` in the container's
+  namespace.**
 
-**UMBus 的设备对象是 PnP 枚举出来的匿名对象，它们不在容器的对象命名空间里。**
+**UMBus's device objects are anonymous objects created by PnP enumeration, and they
+are not in a container's object namespace.**
 
-于是 `CreateFileW` 返回 `ERROR_FILE_NOT_FOUND`——就是那个 `0x80070002`。
+So `CreateFileW` returns `ERROR_FILE_NOT_FOUND` — which is that `0x80070002`.
 
 ---
 
-## 8. 完整失败链
+## 8. The complete failure chain
 
 ```
-容器对象命名空间里没有 \Device\000000NN
-  └─ CreateFileW(UMBus 接口符号链接) → ERROR_FILE_NOT_FOUND (2) = 0x80070002
-       └─ OpenRootUmBusEnumerator 失败 → AddBusEnumerator 失败
-            └─ CTiBus::SetupDevice 失败 → CTiBus::Initialize 失败
-                 └─ CUMRDPProtocolManager::FinalConstruct 失败
+\Device\000000NN is not in the container's object namespace
+  └─ CreateFileW(UMBus interface symlink) -> ERROR_FILE_NOT_FOUND (2) = 0x80070002
+       └─ OpenRootUmBusEnumerator fails -> AddBusEnumerator fails
+            └─ CTiBus::SetupDevice fails -> CTiBus::Initialize fails
+                 └─ CUMRDPProtocolManager::FinalConstruct fails
                       └─ CoCreateInstance(IWRdsProtocolManager) = 0x80070002
-                           └─ 监听器起不来
-                                └─（打补丁绕过之后）会话建立时再撞同一堵墙：
+                           └─ the listener cannot start
+                                └─ (with the bypass patch) session setup hits the
+                                   same wall:
                                      CUMTSInputPlugin::CreateInputDevices
                                        └─ CTiDevice::WaitForDeviceReady
-                                            └─ WaitForSingleObject(就绪事件, 20000) == 258
+                                            └─ WaitForSingleObject(ready event, 20000) == 258
                                                  └─ 0x80070102
-                                                      └─ NotifySessionId 失败
-                                                           └─ AssignSession 失败
-                                                                └─ 客户端卡在
-                                                                   "正在配置远程会话"
-                                                                   约 20 秒后断开
+                                                      └─ NotifySessionId fails
+                                                           └─ AssignSession fails
+                                                                └─ client hangs at
+                                                                   "configuring the remote session"
+                                                                   and disconnects after ~20 s
 ```
 
 ---
 
-## 9. 什么能改、什么不能改
+## 9. What can and cannot be changed
 
 | | |
 |---|---|
-| `TemporaryALiC` 注册表开关 | ✅ 能拆（微软自己留的） |
-| 二进制补丁让监听器起来 | ✅ 能（但只是把输入栈整个跳过去） |
-| 换镜像 / 换 DLL / 改注册表 | ❌ **没用**——限制在容器对象命名空间 |
-| 让容器进程看到 UMBus 设备对象 | ❌ 没有已知办法 |
+| The `TemporaryALiC` registry switch | Yes — Microsoft's own test switch |
+| Binary patches to start the listener | Yes — but only by skipping the whole input stack |
+| A different image, different DLLs, registry edits | **No.** The limit is in the container's object namespace |
+| Making container processes see UMBus device objects | No known way |
 
-**绕过去的代价**：补丁 4（把 `NotifySessionId` 整个跳过）能让客户端连上，
-但那是**把输入栈整个跳过去**换来的——黑屏、无输入、随即断开。
+**What the bypass costs**: patch 4, skipping `NotifySessionId` entirely, does let a
+client connect — but only by **skipping the input stack**, so the result is a black
+screen, no input, and a disconnect shortly after.
 
 ---
 
-## 10. 一个仍未解的矛盾
+## 10. An unresolved contradiction
 
-2018 年那篇文章的环境（Windows Server 1709）是**能用的**，而且作者确认主机没变过。
+The 2018 article's environment (Windows Server 1709) **worked**, and its author
+confirmed the host had not changed.
 
-既然这条限制在宿主内核/对象命名空间这一层，那"镜像更新导致它坏掉"就解释不通。
-能想到的唯一自洽解释是：**1709 的 `rdpcorets.dll` 在 `FinalConstruct` 里不直接调
-`CTiBus::Initialize`**——这一点查过了：
+If the limit is at the host kernel / object namespace level, "an image update broke
+it" does not explain that. The only self-consistent explanation is that **1709's
+`rdpcorets.dll` does not call `CTiBus::Initialize` directly from
+`FinalConstruct`**. That was checked:
 
 | | 1709 RTM | 1709+KB4074588 / 20H2 |
 |---|---|---|
-| `FinalConstruct` 直接调 `CTiBus::Initialize` | **不调**（只经 `CTermInputMgr::Initialize`） | **直接调** |
+| `FinalConstruct` calls `CTiBus::Initialize` directly | **No** (only via `CTermInputMgr::Initialize`) | **Yes** |
 
-但 `CTermInputMgr::Initialize` 那条路同样硬失败、同样透传，**1709 走到会话建立那一步时
-`CreateInputDevices` 也会撞同一堵墙**。
+But the `CTermInputMgr::Initialize` route fails just as hard and passes the same
+error through, so **1709 reaching session setup would hit the same wall in
+`CreateInputDevices`**.
 
-**要收尾需要一台 1709 的宿主机**（作者的已经没有了）。没有的话这条只能挂着。
+**Closing this needs a 1709 host** (the author's is gone). Without one it stays
+open.
 
 ---
 
-## 附录 A：关键函数与偏移
+## Appendix A: key functions and offsets
 
-均在 `rdpcorets.dll` 10.0.19041.x（`servercore:20H2` 镜像）上。
+All in `rdpcorets.dll` 10.0.19041.x from the `servercore:20H2` image.
 
-| 函数 | 说明 |
+| Function | |
 |---|---|
-| `CUMRDPProtocolManager::FinalConstruct` | 建监听器时调 `CTiBus::Initialize` |
-| `CUMRDPConnection::NotifySessionId` | 会话建立；输入块 + 图形块 |
-| `CUMTSInputPlugin::CreateInputDevices` | 建输入设备 |
-| `CTiDevice::WaitForDeviceReady` | 20 秒等待，超时返回 `0x80070102` |
-| `CTiDevice::Initialize` | `CreateEventW` 创建那个就绪事件 |
-| `CTiDevice::SignalReady` | 只在 `SetupDevice` 成功路径上置位 |
-| `CTiBus::Initialize` / `SetupDevice` | 四个失败点；`SetupDevice` 调 `AddBusEnumerator` |
-| `umb.dll!CUMBusDriver::AddBusEnumerator` | 槽位 6（虚表偏移 48） |
-| `umb.dll!CUMBusDriver::CreateBusEnumerator` | `DeviceIoControl(hUMBus, 0x228000, <DWORD 1><名字>, ...)` |
+| `CUMRDPProtocolManager::FinalConstruct` | Calls `CTiBus::Initialize` during listener creation |
+| `CUMRDPConnection::NotifySessionId` | Session setup; the input block and the graphics block |
+| `CUMTSInputPlugin::CreateInputDevices` | Creates the input devices |
+| `CTiDevice::WaitForDeviceReady` | Waits 20 s, returns `0x80070102` on timeout |
+| `CTiDevice::Initialize` | `CreateEventW` creates the ready event |
+| `CTiDevice::SignalReady` | Only signalled on `SetupDevice`'s success path |
+| `CTiBus::Initialize` / `SetupDevice` | Four failure points; `SetupDevice` calls `AddBusEnumerator` |
+| `umb.dll!CUMBusDriver::AddBusEnumerator` | Vtable slot 6 (offset 48) |
+| `umb.dll!CUMBusDriver::CreateBusEnumerator` | `DeviceIoControl(hUMBus, 0x228000, <DWORD 1><name>, ...)` |
 
-### 实验用补丁（**不是修复**，仅供继续分析）
+### Experimental patches (**not fixes**; only to keep analysing)
 
-| 偏移 | 原始 | 替换 | 作用 |
+| Offset | Original | Replacement | Effect |
 |---|---|---|---|
-| `0x16617` | `8b f0` | `31 f6` | `FinalConstruct` 忽略 `CTiBus::Initialize` 失败 |
-| `0x16619` | `85 c0` | `31 c0` | 同上 |
-| `0x464b0` | `48 89 5c` | `31 c0 c3` | `NotifySessionId` 整个跳过（最粗） |
-| `0x4711d` | `8b c7` | `31 c0` | `NotifySessionId` 跑完但返回 0 |
-| `0x46a53` | `0f 85 49 05 00 00` | `e9 4a 05 00 00 90` | 做输入初始化、跳过图形块 |
+| `0x16617` | `8b f0` | `31 f6` | `FinalConstruct` ignores `CTiBus::Initialize`'s failure |
+| `0x16619` | `85 c0` | `31 c0` | As above |
+| `0x464b0` | `48 89 5c` | `31 c0 c3` | Skip `NotifySessionId` entirely (crudest) |
+| `0x4711d` | `8b c7` | `31 c0` | Run `NotifySessionId` but return 0 |
+| `0x46a53` | `0f 85 49 05 00 00` | `e9 4a 05 00 00 90` | Do the input init, skip the graphics block |
 
-`file_offset = VA - 0x180000C00`（该版本镜像）。
+`file_offset = VA - 0x180000C00` for this image version.
 
-### 有用但容易踩坑的 WPP provider
+### WPP providers that are useful and easy to get wrong
 
-| GUID | 组件 |
+| GUID | Component |
 |---|---|
 | `{A3BDED7C-8BEE-3E5A-6499-D41A36E139A4}` | `FinalConstruct` / `CTermInputMgr::Initialize` |
 | `{01F19864-60E9-3C8F-C234-B92505F16052}` | `CTiBus::Initialize` / `CPNPPropertyStore` |
 | `{36ED36ED-D378-351D-064C-923CC188FD7C}` | `CTiBus::Initialize` / `CTiDevice` |
 | `{FD3EE561-44F4-339B-A20A-AFC708B1F8D0}` | `CUMTSInputPlugin::Add*Device` |
-| `{68A65793-594D-393D-5222-0CCF4D4C2E51}` | `CUMRDPListenerVMBus` —— **和本文卡点无关** |
+| `{68A65793-594D-393D-5222-0CCF4D4C2E51}` | `CUMRDPListenerVMBus` — **unrelated to this failure** |
 
-## 附录 B：工具
+## Appendix B: tools
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `Probe-UMBus.c` | **定案探针**。纯 Win32，宿主/容器各跑一遍对比。`/MT` 静态链接 |
-| `Probe-TiBus-Pnp.ps1` | 容器内 PnP 状态查询（`Get-PnpDevice` + 注册表 + `pnputil` 退路） |
-| `Swap-UmbStack-ToHost.ps1` | 交换实验：把宿主机文件覆盖进容器层，含 `-Revert` |
-| `Capture-TermSrvTrace.ps1` | 抓 termsrv / lsm / rdpcorets 的 WPP 输出 |
-| `Patch-RdpCoreTS-OnHost.ps1` | 宿主机侧给容器层打补丁，含 `-Revert` |
+| `Probe-UMBus.c` | **The decisive probe.** Pure Win32; run on host and in container and compare. Statically linked (`/MT`) |
+| `Probe-TiBus-Pnp.ps1` | PnP state inside the container (`Get-PnpDevice`, registry, `pnputil` as a fallback) |
+| `Swap-UmbStack-ToHost.ps1` | The swap experiment: copies host files into a container layer; has `-Revert` |
+| `Capture-TermSrvTrace.ps1` | Captures WPP output from termsrv / lsm / rdpcorets |
+| `Patch-RdpCoreTS-OnHost.ps1` | Patches a container layer from the host; has `-Revert` |
 
-## 附录 C：踩过的坑
+## Appendix C: pitfalls
 
-1. **WPP provider GUID 选错** —— 抓到 0 事件，浪费一轮。见 §4 的编码说明。
-2. **`logman` 的 level 是 UCHAR** —— 写 `0xFFFFFFFF` 报 "Out of present range."，要写 `255`。
-3. **`CM_PROB_PHANTOM` 不是故障** —— `TERMINPUT_BUS` 枚举器是**会话建立时**才创建的，
-   连接 RDP 之前它一直是 phantom，连接之后就变成 OK。把它当故障会带偏方向。
-4. **从外部进程调 `umb.dll` 的 COM 对象容易崩** —— 虚表槽位和调用约定的假设很容易错，
-   而且崩了没有信息。**能用 Win32 系统调用验证的，就不要去调内部函数。**
-5. **`windowsfilter` 层写文件是 ACL 问题，不是只读属性** —— 需要先 `takeown` + `icacls`。
-6. **进程隔离容器共享宿主内核** —— 所以"容器里的驱动状态"和"宿主机的驱动状态"可能不是一回事，
-   而"镜像里的 `.sys` 文件"根本不会被加载。
+1. **The wrong WPP provider GUID** — zero events captured, a round wasted. See the
+   encoding note in section 4.
+2. **`logman`'s level is a UCHAR** — `0xFFFFFFFF` reports "Out of present range.";
+   write `255`.
+3. **`CM_PROB_PHANTOM` is not a fault.** The `TERMINPUT_BUS` enumerator is created
+   **during session setup**, so it is phantom until an RDP client connects and OK
+   afterwards. Reading it as a fault sends you the wrong way.
+4. **Calling `umb.dll`'s COM objects from an external process crashes easily** —
+   assumptions about vtable slots and calling conventions go wrong quietly. **If
+   Win32 system calls can settle a question, do not call internal functions.**
+5. **Writing to a `windowsfilter` layer is an ACL problem, not a read-only
+   attribute** — it needs `takeown` and `icacls` first.
+6. **Process-isolated containers share the host kernel**, so "driver state in the
+   container" and "driver state on the host" can differ, and the `.sys` files in
+   the image are never loaded at all.
 
 ---
 
-*本文记录的是在一台自有虚拟机上对公开镜像和公开系统组件做的分析。*
+*This records analysis of a public image and public system components on a private
+virtual machine.*

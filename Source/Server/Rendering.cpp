@@ -7,6 +7,9 @@
 #include "Event.h"
 
 #include <shared_mutex>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 unsigned long RendererWidth = 1280;
 unsigned long RendererHeight = 720;
@@ -14,78 +17,134 @@ unsigned long RendererHeight = 720;
 SDL_Renderer* gRenderer;
 SDL_Texture* gTexture = nullptr;
 std::atomic<bool> gShouldRender = false;
-unsigned char* gBitmapData;
 unsigned long gWidth, gHeight;
-unsigned long gTextureSizeFilled;
 float WidthRatio = 0.f, HeightRatio = 0.f;
+
+// Size the current gTexture was created for. The container's display mode is
+// changeable, and a texture made for the old size would leave SDL_UpdateTexture
+// writing past the end of it.
+static unsigned long gTextureWidth = 0;
+static unsigned long gTextureHeight = 0;
 
 void MainLoop()
 {
 }
 
-void ClearBitmapData()
+bool ReceiveFrame(unsigned long Width, unsigned long Height, const unsigned char* Data, unsigned long Size)
 {
-	if (gBitmapData)
+	// One frame at a time; decoding one that cannot be presented would just
+	// burn host CPU.
+	if (gShouldRender)
 	{
-		delete[] gBitmapData;
-		gBitmapData = nullptr;
+		return false;
+	}
+
+	if (!gRenderer || !Data || !Size)
+	{
+		return false;
+	}
+
+	SDL_RWops* Ops = SDL_RWFromConstMem(Data, Size);
+	if (!Ops)
+	{
+		return false;
+	}
+
+	SDL_Surface* surface = IMG_LoadPNG_RW(Ops);
+
+	if (!surface)
+	{
+		SDL_RWclose(Ops);
+		return false;
+	}
+
+	if (!gTexture || gTextureWidth != Width || gTextureHeight != Height)
+	{
+		if (gTexture)
+		{
+			SDL_DestroyTexture(gTexture);
+		}
+
+		gTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, Width, Height);
+		gTextureWidth = Width;
+		gTextureHeight = Height;
+	}
+
+	SDL_UpdateTexture(gTexture, &surface->clip_rect, surface->pixels, surface->pitch);
+	SDL_FreeSurface(surface);
+
+	// The client scales mouse coordinates by these, so they have to track the
+	// frame the client is actually sending.
+	gWidth = Width;
+	gHeight = Height;
+	WidthRatio = (float)gWidth / (float)RendererWidth;
+	HeightRatio = (float)gHeight / (float)RendererHeight;
+
+	gShouldRender = true;
+
+	SDL_RWclose(Ops);
+
+	return true;
+}
+
+// The remote cursor, composited by the host at presentation time rather than
+// painted into the frame by the client.
+//
+// Two threads touch this: the RPC thread writes the state and stages the bitmap,
+// the render thread reads the state and owns the SDL texture. SDL textures may
+// only be used from the thread that created the renderer, so the RPC side never
+// touches gCursorTexture.
+static std::mutex gCursorMutex;
+static std::vector<unsigned char> gCursorPending;   // staged bitmap, BGRA
+static unsigned long gCursorPendingW = 0;
+static unsigned long gCursorPendingH = 0;
+static long gCursorPendingHotX = 0;
+static long gCursorPendingHotY = 0;
+
+static SDL_Texture* gCursorTexture = nullptr;       // render thread only
+static unsigned long gCursorTextureW = 0;
+static unsigned long gCursorTextureH = 0;
+static long gCursorHotX = 0;
+static long gCursorHotY = 0;
+
+static std::atomic<long> gCursorX{ 0 };
+static std::atomic<long> gCursorY{ 0 };
+static std::atomic<bool> gCursorVisible{ false };
+
+// Set when something the render loop draws has changed. The cursor moves
+// between frames, so without this it would sit still until the next one.
+static std::atomic<bool> gCursorDirty{ false };
+
+void SetCursorState(long X, long Y, bool Visible)
+{
+	// Only flag a redraw when something actually changed; the client sends the
+	// position every frame.
+	if (gCursorX != X || gCursorY != Y || gCursorVisible != Visible)
+	{
+		gCursorX = X;
+		gCursorY = Y;
+		gCursorVisible = Visible;
+		gCursorDirty = true;
 	}
 }
 
-void BeginImageTransmission(unsigned long Width, unsigned long Height, unsigned long Size)
+void SetCursorShape(unsigned long Width, unsigned long Height, unsigned long HotX,
+	unsigned long HotY, const unsigned char* Pixels, unsigned long Size)
 {
-	ClearBitmapData();
-
-	gWidth = Width;
-	gHeight = Height;
-	gBitmapData = new unsigned char[Size];
-	gTextureSizeFilled = 0;
-	WidthRatio = (float)gWidth / (float)RendererWidth;
-	HeightRatio = (float)gHeight / (float)RendererHeight;
-}
-
-void ReceivedImageData(unsigned long Length, const unsigned char* BitmapData)
-{
-	memcpy(gBitmapData + gTextureSizeFilled, BitmapData, Length);
-	gTextureSizeFilled += Length;
-}
-
-void EndImageTransmission()
-{
-	if (gShouldRender)
+	if (!Pixels || !Width || !Height || Size < Width * Height * 4)
 	{
-		// hasn't rendered yet
 		return;
 	}
 
-	if (gRenderer)
-	{
-		SDL_RWops* Ops = SDL_RWFromConstMem(gBitmapData, gTextureSizeFilled);
-		if (!Ops)
-		{
-			return;
-		}
+	std::lock_guard<std::mutex> lock(gCursorMutex);
 
-		if (!gTexture)
-		{
-			gTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, gWidth, gHeight);
-		}
+	gCursorPending.assign(Pixels, Pixels + (size_t)Width * Height * 4);
+	gCursorPendingW = Width;
+	gCursorPendingH = Height;
+	gCursorPendingHotX = (long)HotX;
+	gCursorPendingHotY = (long)HotY;
 
-		SDL_Surface* surface = IMG_LoadPNG_RW(Ops);
-		if (surface)
-		{
-			SDL_Rect src{ 0, 0, (int)surface->w, (int)surface->h };
-			SDL_Rect target{ 0, 0, (int)gWidth, (int)gHeight };
-			SDL_UpdateTexture(gTexture, &surface->clip_rect, surface->pixels, surface->pitch);
-			SDL_FreeSurface(surface);
-		}
-
-		gShouldRender = true;
-
-		SDL_RWclose(Ops);
-	}
-
-	ClearBitmapData();
+	gCursorDirty = true;
 }
 
 static int scanCodeToKeyNum[SDL_NUM_SCANCODES] = {
@@ -517,6 +576,11 @@ void InitVideo()
 	unsigned long CurrentWidth = 0;
 	unsigned long CurrentHeight = 0;
 
+	// Whether the host's own cursor has been hidden yet, and whether the remote
+	// one has ever been drawn; see the render loop.
+	bool bHostCursorHidden = false;
+	bool bDrewCursor = false;
+
 	//gRenderer = new Renderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
 	for (;;)
@@ -569,14 +633,86 @@ void InitVideo()
 			RendererHeight = CurrentHeight;
 		}
 
-		if (gShouldRender)
+		// Turn a staged cursor bitmap into a texture. The RPC thread only stages
+		// pixels; SDL textures belong to the thread that created the renderer.
 		{
-			SDL_RenderClear(gRenderer);
+			std::lock_guard<std::mutex> lock(gCursorMutex);
 
-			SDL_RenderCopy(gRenderer, gTexture, nullptr, nullptr);
-			SDL_RenderPresent(gRenderer);
+			if (!gCursorPending.empty())
+			{
+				if (gCursorTexture)
+				{
+					SDL_DestroyTexture(gCursorTexture);
+					gCursorTexture = nullptr;
+				}
+
+				// The client sends BGRA, which is SDL_PIXELFORMAT_ARGB8888 in
+				// memory on a little-endian machine, with straight alpha --
+				// which is what SDL_BLENDMODE_BLEND expects.
+				gCursorTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
+					SDL_TEXTUREACCESS_STATIC, (int)gCursorPendingW, (int)gCursorPendingH);
+
+				if (gCursorTexture)
+				{
+					SDL_UpdateTexture(gCursorTexture, NULL, gCursorPending.data(),
+						(int)gCursorPendingW * 4);
+					SDL_SetTextureBlendMode(gCursorTexture, SDL_BLENDMODE_BLEND);
+
+					gCursorTextureW = gCursorPendingW;
+					gCursorTextureH = gCursorPendingH;
+					gCursorHotX = gCursorPendingHotX;
+					gCursorHotY = gCursorPendingHotY;
+				}
+
+				gCursorPending.clear();
+			}
+		}
+
+		// Repaint when a frame arrived, or when the cursor moved. The cursor
+		// moves between frames -- up to a second apart with the desktop-change
+		// skip on -- so without the second condition it would sit still.
+		if (gShouldRender || gCursorDirty)
+		{
+			if (gTexture)
+			{
+				SDL_RenderClear(gRenderer);
+
+				SDL_RenderCopy(gRenderer, gTexture, nullptr, nullptr);
+
+				// The remote cursor goes on top, in window coordinates. The
+				// client's coordinates are container pixels, so they scale by
+				// the same ratio mouse events use the other way.
+				if (gCursorTexture && gCursorVisible && WidthRatio > 0.f && HeightRatio > 0.f)
+				{
+					const long cx = gCursorX;
+					const long cy = gCursorY;
+
+					SDL_Rect dst;
+					dst.x = (int)((cx - gCursorHotX) / WidthRatio);
+					dst.y = (int)((cy - gCursorHotY) / HeightRatio);
+					dst.w = (int)(gCursorTextureW / WidthRatio);
+					dst.h = (int)(gCursorTextureH / HeightRatio);
+
+					SDL_RenderCopy(gRenderer, gCursorTexture, nullptr, &dst);
+
+					bDrewCursor = true;
+				}
+
+				SDL_RenderPresent(gRenderer);
+			}
 
 			gShouldRender = false;
+			gCursorDirty = false;
+		}
+
+		// Hide the host's own cursor, but only once the remote one has actually
+		// been drawn. Hiding it earlier leaves the user with no cursor at all if
+		// the cursor state is ever wrong, which is how the first version of this
+		// behaved.
+		if (bDrewCursor && !bHostCursorHidden)
+		{
+			SDL_ShowCursor(SDL_DISABLE);
+			bHostCursorHidden = true;
 		}
 
 		SDL_Delay(1);

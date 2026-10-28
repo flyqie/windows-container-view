@@ -8,6 +8,7 @@
 
 #include <iostream>
 
+#include "../Common/SandboxLog.h"
 #include "printwnd.h"
 
 using namespace std;
@@ -134,19 +135,86 @@ typedef struct {
 
 HBITMAP ghTempBitmap = NULL;
 
+// The full-screen target, kept across frames.
+//
+// A DIB section rather than a CreateCompatibleBitmap, because its bits are
+// directly addressable: the frame can be handed to GDI+ and compared against the
+// previous one without either of the two full-screen copies a device-dependent
+// bitmap would need. Measured, those copies were 2.4-3.7 ms of an 8.6 ms idle
+// frame. Reused until the screen size changes.
+static HBITMAP gTargetBitmap = NULL;
+static void* gTargetBits = NULL;
+static int gTargetWidth = 0;
+static int gTargetHeight = 0;
+
+// PrintWindow() calls made since the last PrintScreen() reset.
+static unsigned gPrintWindowCalls = 0;
+
+// Profiling is off unless SANDBOX_DEBUG is set, and when it is off nothing below
+// reads the clock.
+//
+// Measured on the development machine, a QueryPerformanceCounter pair plus the
+// conversion costs 31.7 ns, and a frame takes 9 + (one per window) of them --
+// about 0.3 us idle and 0.8 us with a dialog open, or 0.003% of a 33 ms frame. It
+// is not a real cost; it is gated because there is no reason for it not to be.
+static const bool gProfile = DebugEnabled();
+
+// Breakdown of the last PrintScreen() pass, and the clock its parts are timed
+// against.
+static CaptureBreakdown gBreakdown = { 0 };
+static LARGE_INTEGER gQpcFrequency = { 0 };
+
+// The two halves of the window pass, folded into gBreakdown when it ends.
+static ULONGLONG gTopLevelPrintUs = 0;
+static ULONGLONG gChildReprintUs = 0;
+static unsigned gTopLevelCalls = 0;
+static unsigned gChildCalls = 0;
+
+// Starts a timer, or leaves it zero when profiling is off.
+static void Begin(LARGE_INTEGER& Start)
+{
+	if (gProfile)
+	{
+		QueryPerformanceCounter(&Start);
+	}
+}
+
+// Microseconds since Begin, or 0 when profiling is off.
+static ULONGLONG Since(const LARGE_INTEGER& Start)
+{
+	if (!gProfile)
+	{
+		return 0;
+	}
+
+	LARGE_INTEGER Now;
+	QueryPerformanceCounter(&Now);
+
+	return (ULONGLONG)((Now.QuadPart - Start.QuadPart) * 1000000LL / gQpcFrequency.QuadPart);
+}
+
+// Paints hwnd into hdc and counts the call.
+//
+// There used to be a variant here that sent WM_PRINT directly instead of calling
+// PrintWindow, to avoid the PRF_CHILDREN recursion. It does not work: an HDC is
+// only meaningful in the calling process, so the frame came back empty. See
+// Docs/PERFORMANCE.md, experiment B.
+static void PaintWindow(HWND hwnd, HDC hdc)
+{
+	PrintWindow(hwnd, hdc, 0);
+
+	++gPrintWindowCalls;
+}
+
 // Re-prints every descendant of hwnd into hdc.
 //
-// PrintWindow reaches children through the parent's PRF_CHILDREN pass, and that
-// pass does not reliably draw every themed common control: a status bar comes
-// out with its background painted but its parts missing, on a random subset of
-// frames. Printing each descendant again on top fixes it. The container has no
-// DWM, so WM_PRINT is the only way to get pixels at all; there is no screen
-// surface to read instead.
+// The container has no DWM, so WM_PRINT is the only way to get pixels at all,
+// and its PRF_CHILDREN pass misses themed common controls; printing each
+// descendant again on top fixes that.
 //
 // GetWindow(GW_CHILD)/GW_HWNDNEXT walks from the topmost child down, so the
-// children are iterated in reverse to paint the bottom-most first and leave the
-// topmost painted last. OriginX/OriginY are the screen coordinates of hdc's
-// origin, needed to place each child inside the DC.
+// children are iterated in reverse to leave the topmost painted last.
+// OriginX/OriginY are the screen coordinates of hdc's origin.
 static void PrintWindowTree(HWND hwnd, HDC hdc, int OriginX, int OriginY)
 {
 	std::vector<HWND> Children;
@@ -169,7 +237,13 @@ static void PrintWindowTree(HWND hwnd, HDC hdc, int OriginX, int OriginY)
 		POINT OldOrigin;
 		SetViewportOrgEx(hdc, r.left - OriginX, r.top - OriginY, &OldOrigin);
 
-		PrintWindow(*it, hdc, 0);
+		LARGE_INTEGER PrintStart;
+		Begin(PrintStart);
+
+		PaintWindow(*it, hdc);
+		++gChildCalls;
+
+		gChildReprintUs += Since(PrintStart);
 
 		PrintWindowTree(*it, hdc, OriginX, OriginY);
 
@@ -222,7 +296,17 @@ BOOL CALLBACK EnumWindowsProc(
 	RECT Scratch{ 0, 0, w, h };
 	FillRect(hdcWindowMemory, &Scratch, GetSysColorBrush(COLOR_DESKTOP));
 
-	PrintWindow(hwnd, hdcWindowMemory, 0);
+	LARGE_INTEGER PrintStart;
+	Begin(PrintStart);
+
+	PaintWindow(hwnd, hdcWindowMemory);
+	++gTopLevelCalls;
+
+	gTopLevelPrintUs += Since(PrintStart);
+
+	// Re-print every visible descendant. PrintWindow reaches children through
+	// its PRF_CHILDREN pass, and that pass does not reliably draw themed common
+	// controls -- a status bar comes out with its background but no parts.
 	PrintWindowTree(hwnd, hdcWindowMemory, x, y);
 
 	BitBlt(Param->hdcMemory, x, y, w, h, hdcWindowMemory, 0, 0, SRCCOPY);
@@ -233,42 +317,173 @@ BOOL CALLBACK EnumWindowsProc(
 	return TRUE;
 }
 
-void DrawCursor(HDC hDC)
+void ReadCursor(CursorInfo& Out)
 {
+	Out = CursorInfo();
+
 	CURSORINFO cursor = { sizeof(cursor) };
-	GetCursorInfo(&cursor);
-
-	if (!cursor.hCursor)
+	if (!GetCursorInfo(&cursor))
 	{
-		// Use the default cursor image
-		cursor.hCursor = (HCURSOR)LoadImage(NULL, MAKEINTRESOURCE(OCR_NORMAL), IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+		return;
 	}
 
-	if (cursor.flags != CURSOR_SUPPRESSED)
+	Out.X = cursor.ptScreenPos.x;
+	Out.Y = cursor.ptScreenPos.y;
+
+	// CURSOR_SUPPRESSED is the only state that means "do not draw this".
+	//
+	// Testing for CURSOR_SHOWING instead -- the obvious reading of the flag --
+	// reports the cursor as hidden on this desktop. The container's window
+	// station is created by the client rather than by winlogon, and it reports
+	// flags 0 while still having a cursor worth drawing. The original DrawCursor
+	// tested for SUPPRESSED too, which is why the cursor used to appear.
+	Out.Visible = cursor.flags != CURSOR_SUPPRESSED;
+
+	// The bitmap only changes a few times a minute, so it is only read when the
+	// handle changes. A shared system cursor keeps one handle for its lifetime,
+	// and these are the system's own cursors.
+	static HCURSOR LastCursor = NULL;
+
+	if (cursor.hCursor == LastCursor)
 	{
-		ICONINFO info = { sizeof(info) };
-		GetIconInfo(cursor.hCursor, &info);
+		return;
+	}
 
-		const int x = cursor.ptScreenPos.x - info.xHotspot;
-		const int y = cursor.ptScreenPos.y - info.yHotspot;
+	HCURSOR hCursor = cursor.hCursor;
 
-		BITMAP bmpCursor = { 0 };
-		GetObject(info.hbmColor, sizeof(bmpCursor), &bmpCursor);
+	if (!hCursor)
+	{
+		// No cursor handle yet; fall back to the system arrow so the host has
+		// something to draw.
+		hCursor = (HCURSOR)LoadImage(NULL, MAKEINTRESOURCE(OCR_NORMAL), IMAGE_CURSOR, 0, 0,
+			LR_DEFAULTSIZE | LR_SHARED);
+	}
 
-		DrawIconEx(hDC, x, y, cursor.hCursor, 0, 0, 0, NULL, DI_NORMAL | DI_DEFAULTSIZE);
+	if (!hCursor)
+	{
+		return;
+	}
 
+	ICONINFO info = { sizeof(info) };
+	if (!GetIconInfo(hCursor, &info))
+	{
+		return;
+	}
+
+	// hbmColor is null for the legacy mask-only cursors. Those are rare enough
+	// that the host just keeps the cursor it already has rather than growing a
+	// second render path here.
+	if (!info.hbmColor)
+	{
 		DeleteObject(info.hbmMask);
-		DeleteObject(info.hbmColor);
+		return;
 	}
+
+	BITMAP bm = { 0 };
+	GetObject(info.hbmColor, sizeof(bm), &bm);
+
+	const unsigned long W = (unsigned long)bm.bmWidth;
+	const unsigned long H = (unsigned long)bm.bmHeight;
+
+	// Ask GetDIBits for BGRA rather than drawing through DrawIconEx: GDI does
+	// not maintain the alpha channel, and a 32bpp cursor's alpha is what makes
+	// it composite correctly over the frame.
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = (LONG)W;
+	bmi.bmiHeader.biHeight = -(LONG)H;   // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	const unsigned long HotX = (unsigned long)info.xHotspot;
+	const unsigned long HotY = (unsigned long)info.yHotspot;
+
+	std::vector<unsigned char> Pixels((size_t)W * H * 4);
+
+	HDC hdc = CreateCompatibleDC(NULL);
+	const int Got = GetDIBits(hdc, info.hbmColor, 0, H, Pixels.data(), &bmi, DIB_RGB_COLORS);
+	DeleteDC(hdc);
+
+	DeleteObject(info.hbmColor);
+	DeleteObject(info.hbmMask);
+
+	if (!Got)
+	{
+		return;
+	}
+
+	LastCursor = cursor.hCursor;
+
+	Out.ShapeChanged = true;
+	Out.Width = W;
+	Out.Height = H;
+	Out.HotX = HotX;
+	Out.HotY = HotY;
+	Out.Shape.swap(Pixels);
+}
+
+// Returns the full-screen DIB, rebuilding it only when the size changes, and
+// hands back a pointer to its bits.
+static HBITMAP EnsureTargetBitmap(HDC hdcSource, int Width, int Height, void** Bits)
+{
+	if (gTargetBitmap && gTargetWidth == Width && gTargetHeight == Height)
+	{
+		*Bits = gTargetBits;
+		return gTargetBitmap;
+	}
+
+	if (gTargetBitmap)
+	{
+		DeleteObject(gTargetBitmap);
+		gTargetBitmap = NULL;
+		gTargetBits = NULL;
+	}
+
+	BITMAPINFO Info = { 0 };
+	Info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	Info.bmiHeader.biWidth = Width;
+	Info.bmiHeader.biHeight = -Height;   // top-down, so the bits start at the top row
+	Info.bmiHeader.biPlanes = 1;
+	Info.bmiHeader.biBitCount = 32;
+	Info.bmiHeader.biCompression = BI_RGB;
+
+	gTargetBitmap = CreateDIBSection(hdcSource, &Info, DIB_RGB_COLORS, Bits, NULL, 0);
+
+	if (!gTargetBitmap)
+	{
+		return NULL;
+	}
+
+	gTargetBits = *Bits;
+	gTargetWidth = Width;
+	gTargetHeight = Height;
+
+	return gTargetBitmap;
 }
 
 Bitmap* PrintScreen(HDESK hDesktop)
 {
+	// Reset on entry so the caller can read this frame's count once we return.
+	gPrintWindowCalls = 0;
+	gTopLevelPrintUs = 0;
+	gChildReprintUs = 0;
+	gTopLevelCalls = 0;
+	gChildCalls = 0;
+
+	if (gProfile && !gQpcFrequency.QuadPart)
+	{
+		QueryPerformanceFrequency(&gQpcFrequency);
+	}
+
+	LARGE_INTEGER TotalStart;
+	Begin(TotalStart);
+
 	// Get the display DC
 	HDC hdcSource = GetDC(NULL);
 	if (!hdcSource)
 	{
-		cout << "DC could not be retrieved" << endl;
+		Debug() << "DC could not be retrieved" << endl;
 		return NULL;
 	}
 
@@ -285,9 +500,24 @@ Bitmap* PrintScreen(HDESK hDesktop)
 		ghTempBitmap = CreateCompatibleBitmap(hdcSource, capX, capY);
 	}
 
-	// Create a bitmap covering the whole screen
-	HBITMAP hBitmap = CreateCompatibleBitmap(hdcSource, capX, capY);
-	SelectObject(hdcMemory, hBitmap);
+	// The full-screen target, reused across frames. See gTargetBitmap.
+	LARGE_INTEGER AllocStart;
+	Begin(AllocStart);
+
+	void* Bits = NULL;
+	HBITMAP hBitmap = EnsureTargetBitmap(hdcSource, capX, capY, &Bits);
+
+	gBreakdown.BitmapAlloc = Since(AllocStart);
+
+	if (!hBitmap)
+	{
+		DeleteDC(hdcMemory);
+		ReleaseDC(NULL, hdcSource);
+
+		return NULL;
+	}
+
+	HGDIOBJ hOldTarget = SelectObject(hdcMemory, hBitmap);
 
 	EnumWindowParam EnumParam;
 	EnumParam.ScreenWidth = capX;
@@ -295,13 +525,23 @@ Bitmap* PrintScreen(HDESK hDesktop)
 	EnumParam.hdcMemory = hdcMemory;
 	EnumParam.hdcSource = hdcSource;
 
-	// Fill background with the desktop color
-	Rectangle(hdcMemory, 0, 0, capX, capY);
+	// Fill background with the desktop color.
+	//
+	// FillRect covers the whole DC, so the Rectangle() that used to precede it
+	// -- which filled the same area with the DC's default white brush -- was
+	// overwritten in full and only bought a second full-screen pass.
+	LARGE_INTEGER FillStart;
+	Begin(FillStart);
 
 	RECT r{ 0, 0, capX, capY };
 	FillRect(hdcMemory, &r, GetSysColorBrush(COLOR_DESKTOP));
 
+	gBreakdown.Fills = Since(FillStart);
+
 	std::vector<HWND> hwndList;
+
+	LARGE_INTEGER PassStart;
+	Begin(PassStart);
 
 	// Gather list of windows, so they can be drawn in reverse order
 	// otherwise the back windows will appear first
@@ -312,17 +552,57 @@ Bitmap* PrintScreen(HDESK hDesktop)
 		EnumWindowsProc(*rit, (LPARAM)& EnumParam);
 	}
 
+	gBreakdown.WindowPass = Since(PassStart);
+	gBreakdown.TopLevelPrint = gTopLevelPrintUs;
+	gBreakdown.ChildReprint = gChildReprintUs;
+	gBreakdown.TopLevelCalls = gTopLevelCalls;
+	gBreakdown.ChildCalls = gChildCalls;
+
 	// If you uncomment this, it will draw the entire screen but it will look very messy, and there will be no console windows
 	//BitBlt(hdcMemory, 0, 0, capX, capY, hdcSource, 0, 0, SRCCOPY);
 
-	DrawCursor(hdcMemory);
+	// The cursor is deliberately not drawn here. See ReadCursor.
 
-	// Convert bitmap into a GDI+ Bitmap
-	Bitmap* bmp = Bitmap::FromHBITMAP(hBitmap, NULL);
-
-	DeleteObject(hBitmap);
+	// Deselect before the DC goes away: the bitmap outlives it now.
+	SelectObject(hdcMemory, hOldTarget);
 	DeleteDC(hdcMemory);
 	ReleaseDC(NULL, hdcSource);
+
+	LARGE_INTEGER GdiPlusStart;
+	Begin(GdiPlusStart);
+
+	// GDI leaves a DIB section's alpha byte at zero, so set it.
+	//
+	// The wrap below is PixelFormat32bppARGB and the host's texture is RGBA32,
+	// so the PNG has to stay 32bpp; an untouched alpha would encode a fully
+	// transparent frame. One pass over the screen, against the full-screen copy
+	// this replaces.
+	{
+		DWORD* Pixel = (DWORD*)Bits;
+		const size_t Count = (size_t)capX * capY;
+
+		for (size_t i = 0; i < Count; ++i)
+		{
+			Pixel[i] |= 0xFF000000u;
+		}
+	}
+
+	// Wrap the DIB bits rather than copying them into a GDI+ bitmap, which is
+	// what Bitmap::FromHBITMAP does.
+	//
+	// The returned bitmap does not own the pixels, and must not outlive the next
+	// PrintScreen call, which redraws the same buffer.
+	Bitmap* bmp = new Bitmap(capX, capY, capX * 4, PixelFormat32bppARGB, (BYTE*)Bits);
+
+	if (bmp && bmp->GetLastStatus() != Ok)
+	{
+		delete bmp;
+		bmp = NULL;
+	}
+
+	gBreakdown.ToGdiPlus = Since(GdiPlusStart);
+
+	gBreakdown.Total = Since(TotalStart);
 
 	return bmp;
 }
@@ -427,4 +707,25 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 
 	free(pImageCodecInfo);
 	return -1;  // Failure
+}
+
+unsigned GetLastPrintWindowCallCount()
+{
+	return gPrintWindowCalls;
+}
+
+const unsigned char* GetLastFrameBits()
+{
+	return (const unsigned char*)gTargetBits;
+}
+
+int GetLastFrameStride()
+{
+	// Top-down 32bpp DIB: rows are contiguous, no padding.
+	return gTargetWidth * 4;
+}
+
+const CaptureBreakdown& GetLastCaptureBreakdown()
+{
+	return gBreakdown;
 }

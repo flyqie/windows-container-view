@@ -5,6 +5,9 @@
 #include <stdio.h>
 
 #include <iostream>
+#include <vector>
+
+#include "../Common/SandboxLog.h"
 
 using namespace std;
 
@@ -25,7 +28,7 @@ void TweakWindowStation()
 	HWINSTA hWinSta = OpenWindowStation(TEXT("WinSta0"), FALSE, GENERIC_EXECUTE | WRITE_DAC);
 	if (!hWinSta)
 	{
-		cout << "Opening WinSta0 failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "Opening WinSta0 failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
@@ -35,7 +38,7 @@ void TweakWindowStation()
 	HDESK hDesktop = OpenDesktop(TEXT("Default"), 0, FALSE, GENERIC_READ | WRITE_DAC);
 	if (!hDesktop)
 	{
-		cout << "Opening Default desktop failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "Opening Default desktop failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
@@ -83,7 +86,7 @@ void TweakWindowStation()
 
 			if (Status)
 			{
-				cout << "SetSecurityInfo returned " << hex << Status << endl;
+				Debug() << "SetSecurityInfo returned " << hex << Status << endl;
 			}
 
 			// Set all permissions for the desktop object
@@ -99,17 +102,17 @@ void TweakWindowStation()
 
 			if (Status)
 			{
-				cout << "SetSecurityInfo returned " << hex << Status << endl;
+				Debug() << "SetSecurityInfo returned " << hex << Status << endl;
 			}
 		}
 		else
 		{
-			cout << "AdjustTokenPrivileges failed (err 0x" << hex << GetLastError() << ")" << endl;
+			Debug() << "AdjustTokenPrivileges failed (err 0x" << hex << GetLastError() << ")" << endl;
 		}
 	}
 	else
 	{
-		cout << "SetEntriesInAcl returned " << hex << Status << endl;
+		Debug() << "SetEntriesInAcl returned " << hex << Status << endl;
 	}
 
 	LocalFree(Dacl);
@@ -124,28 +127,28 @@ void AssignWindowStation()
 	HWINSTA hWinSta = CreateWindowStation(TEXT("WinSta0"), 0, GENERIC_ALL, NULL); // OpenWindowStation(TEXT("WinSta0"), FALSE, GENERIC_ALL);
 	if (!hWinSta)
 	{
-		cout << "Opening WinSta0 failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "Opening WinSta0 failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
 	HWINSTA hOldWinsta = GetProcessWindowStation();
 	if (!SetProcessWindowStation(hWinSta))
 	{
-		cout << "SetProcessWindowStation failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "SetProcessWindowStation failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
 	HDESK hDesktop = CreateDesktop(TEXT("Default"), NULL, NULL, 0, GENERIC_ALL, NULL);
 	if (!hDesktop)
 	{
-		cout << "Opening hDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "Opening hDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
 	HDESK hOldDesktop = GetThreadDesktop(GetCurrentThreadId());
 	if (!SetThreadDesktop(hDesktop))
 	{
-		cout << "SetThreadDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "SetThreadDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
 		return;
 	}
 
@@ -165,17 +168,17 @@ void AssignWindowStation()
 	Flags.dwFlags = WSF_VISIBLE;
 	if (!SetUserObjectInformation(hWinSta, UOI_FLAGS, &Flags, sizeof(Flags)))
 	{
-		cout << "SetUserObjectInformation failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "SetUserObjectInformation failed (err 0x" << hex << GetLastError() << ")" << endl;
 	}
 
 	// Switch to the Default desktop
 	if (!SwitchDesktop(hDesktop))
 	{
-		cout << "SwitchDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
+		Debug() << "SwitchDesktop failed (err 0x" << hex << GetLastError() << ")" << endl;
 	}
 }
 
-void StartProgram()
+void StartProgram(const wchar_t* Command)
 {
 	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
@@ -206,15 +209,19 @@ void StartProgram()
 
 	GetUserObjectInformation(hDesktop, UOI_NAME, lpDesktop + nWinStaNameLength, nDesktopNameSize, &nDesktopNameSize);
 
-	wcout << L"Desktop: " << lpDesktop << endl;
+	DebugW() << L"Desktop: " << lpDesktop << endl;
 
 	si.lpDesktop = lpDesktop;
 
-	TCHAR szCommand[] = TEXT("cmd.exe");
+	// cmd.exe unless the caller named something else.
+	const wchar_t* ToRun = (Command && *Command) ? Command : L"cmd.exe";
+
+	// CreateProcess may modify the command line, so it needs a writable copy.
+	std::vector<wchar_t> CommandLine(ToRun, ToRun + wcslen(ToRun) + 1);
 
 	BOOL Result = CreateProcess(
 		NULL,
-		szCommand,
+		CommandLine.data(),
 		NULL,
 		NULL,
 		FALSE,
@@ -229,11 +236,11 @@ void StartProgram()
 
 	if (!Result)
 	{
-		cout << "Process creation failed: error " << GetLastError() << endl;
+		Debug() << "Process creation failed: error " << GetLastError() << endl;
 		return;
 	}
 
-	cout << "Waiting for input..." << endl;
+	Debug() << "Waiting for input..." << endl;
 	WaitForInputIdle(pi.hProcess, INFINITE);
 
 	// Wait until a window is drawn
@@ -244,5 +251,5 @@ void StartProgram()
 		Sleep(100);
 	}
 
-	cout << "Done" << endl;
+	Debug() << "Done" << endl;
 }

@@ -37,16 +37,17 @@ void EventManager::EmitKeyboardEvent(int keyIndex, bool bKeyDown)
 	m_eventQueue.push(event);
 }
 
-bool EventManager::PopEvent(SandboxEvent& event)
+unsigned EventManager::PopEvents(struct SandboxEvent* Events, unsigned Max)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 
-	if (m_eventQueue.empty())
+	unsigned Count = 0;
+
+	while (Count < Max && !m_eventQueue.empty())
 	{
-		return false;
+		Events[Count++] = m_eventQueue.front();
+		m_eventQueue.pop();
 	}
 
-	event = m_eventQueue.front();
-	m_eventQueue.pop();
-	return true;
+	return Count;
 }
