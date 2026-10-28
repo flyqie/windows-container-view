@@ -200,9 +200,16 @@ So the experiment was to **swap**: copy the host's working pair over the contain
 CU-layer copies.
 
 ```powershell
-# See Tools/Swap-UmbStack-ToHost.ps1
 docker stop <container>
-.\Swap-UmbStack-ToHost.ps1 -Apply      # needs takeown + icacls first; windowsfilter layers are an ACL problem
+
+# takeown + icacls first: a windowsfilter layer refuses writes on ACL grounds,
+# not because it is read-only. Then copy rdpcorets.dll and umb.dll from
+# C:\Windows\System32 into the container's layer directory.
+takeown /f <layer>\Files\Windows\System32\rdpcorets.dll
+icacls  <layer>\Files\Windows\System32\rdpcorets.dll /grant Administrators:F
+copy /y C:\Windows\System32\rdpcorets.dll <layer>\Files\Windows\System32\
+copy /y C:\Windows\System32\umb.dll       <layer>\Files\Windows\System32\
+
 docker start <container>
 ```
 
@@ -227,8 +234,9 @@ difference is conclusively ruled out.**
 
 ## 7. Root cause: the container's object namespace
 
-A **pure Win32** probe (`Tools/Probe-UMBus.c` — it does not call `umb.dll` and does
-not use its vtables) was run on the host and in the container:
+A **pure Win32** probe — it does not call `umb.dll` and does not use its vtables,
+so nothing in it depends on the assumptions under test — was run on the host and in
+the container:
 
 | Probe | Host | Container |
 |---|---|---|
@@ -365,15 +373,18 @@ All in `rdpcorets.dll` 10.0.19041.x from the `servercore:20H2` image.
 | `{FD3EE561-44F4-339B-A20A-AFC708B1F8D0}` | `CUMTSInputPlugin::Add*Device` |
 | `{68A65793-594D-393D-5222-0CCF4D4C2E51}` | `CUMRDPListenerVMBus` — **unrelated to this failure** |
 
-## Appendix B: tools
+## Appendix B: what the investigation needed
 
-| File | Purpose |
+These were written for this analysis and are **not part of this repository**. They
+are described so the work can be redone, not so they can be run from here.
+
+| Tool | Purpose |
 |---|---|
-| `Probe-UMBus.c` | **The decisive probe.** Pure Win32; run on host and in container and compare. Statically linked (`/MT`) |
-| `Probe-TiBus-Pnp.ps1` | PnP state inside the container (`Get-PnpDevice`, registry, `pnputil` as a fallback) |
-| `Swap-UmbStack-ToHost.ps1` | The swap experiment: copies host files into a container layer; has `-Revert` |
-| `Capture-TermSrvTrace.ps1` | Captures WPP output from termsrv / lsm / rdpcorets |
-| `Patch-RdpCoreTS-OnHost.ps1` | Patches a container layer from the host; has `-Revert` |
+| A pure Win32 UMBus probe | **The decisive one.** It does not call `umb.dll` and does not use its vtables, so nothing in it depends on the assumptions under test. Run on the host and in the container and compare the two outputs. Statically linked (`/MT`) so it needs no runtime in the container |
+| A PnP state dump | Inside the container: `Get-PnpDevice`, the relevant registry keys, `pnputil` as a fallback |
+| A layer swap script | The swap experiment in section 6: copies host files into a container layer, with an undo path |
+| A WPP capture script | Starts an ETW session against termsrv, lsm and rdpcorets and collects the trace |
+| A host-side patcher | Applies the offsets in appendix A to a container layer, with an undo path |
 
 ## Appendix C: pitfalls
 
