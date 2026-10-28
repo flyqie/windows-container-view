@@ -52,3 +52,35 @@ const wchar_t* SandboxHost()
 
 	return Value.c_str();
 }
+
+bool SandboxResolution(int& Width, int& Height)
+{
+	static const std::wstring Value = Read(L"SANDBOX_RESOLUTION");
+
+	if (Value.empty())
+	{
+		return false;
+	}
+
+	const size_t Separator = Value.find_first_of(L"xX*,");
+
+	if (Separator == std::wstring::npos)
+	{
+		return false;
+	}
+
+	const long W = wcstol(Value.c_str(), NULL, 10);
+	const long H = wcstol(Value.c_str() + Separator + 1, NULL, 10);
+
+	// A sanity range, not a mode list: what the display driver actually accepts
+	// is checked by the driver itself.
+	if (W < 100 || H < 100 || W > 16384 || H > 16384)
+	{
+		return false;
+	}
+
+	Width = (int)W;
+	Height = (int)H;
+
+	return true;
+}

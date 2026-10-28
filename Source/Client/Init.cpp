@@ -178,6 +178,40 @@ void AssignWindowStation()
 	}
 }
 
+bool SetDisplayMode(int Width, int Height)
+{
+	DEVMODEW Mode;
+	memset(&Mode, 0, sizeof(Mode));
+
+	Mode.dmSize = sizeof(Mode);
+
+	// All four fields are required, not just the size.
+	//
+	// The stub display driver validates a requested mode by looking for it in
+	// its mode table with the bit depth and refresh rate attached, and falls
+	// back to the default when any of them is left unset. See
+	// Docs/IMAGE-ANALYSIS.md.
+	Mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+	Mode.dmPelsWidth = (DWORD)Width;
+	Mode.dmPelsHeight = (DWORD)Height;
+	Mode.dmBitsPerPel = 32;
+	Mode.dmDisplayFrequency = 60;
+
+	const LONG Result = ChangeDisplaySettingsW(&Mode, 0);
+
+	if (Result != DISP_CHANGE_SUCCESSFUL)
+	{
+		Debug() << "ChangeDisplaySettings to " << Width << "x" << Height
+		        << " rejected (code " << Result << ")" << endl;
+
+		return false;
+	}
+
+	Debug() << "Display mode set to " << Width << "x" << Height << endl;
+
+	return true;
+}
+
 void StartProgram(const wchar_t* Command)
 {
 	STARTUPINFO si;

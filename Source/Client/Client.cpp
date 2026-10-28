@@ -486,6 +486,21 @@ void SandboxInitClient(const wchar_t* Host, const wchar_t* Command)
 	// Set some colors
 	RegisterDesktopWindow();
 
+	// Before the program starts, so it opens at the right size.
+	//
+	// The frame path adapts on its own: the capture reads the screen size every
+	// frame and rebuilds its buffers when it changes, and the server rebuilds
+	// its texture when the frame size changes.
+	{
+		int ModeWidth = 0;
+		int ModeHeight = 0;
+
+		if (SandboxResolution(ModeWidth, ModeHeight))
+		{
+			SetDisplayMode(ModeWidth, ModeHeight);
+		}
+	}
+
 	Debug() << "Starting " << (Command && *Command ? "the requested program" : "CMD") << "..." << endl;
 	StartProgram(Command);
 

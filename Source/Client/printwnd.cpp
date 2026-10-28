@@ -134,6 +134,8 @@ typedef struct {
 } EnumWindowParam;
 
 HBITMAP ghTempBitmap = NULL;
+static int gTempBitmapWidth = 0;
+static int gTempBitmapHeight = 0;
 
 // The full-screen target, kept across frames.
 //
@@ -493,11 +495,19 @@ Bitmap* PrintScreen(HDESK hDesktop)
 
 	HDC hdcMemory = CreateCompatibleDC(hdcSource);
 
-	if(!ghTempBitmap)
+	// One scratch bitmap shared by every window and every frame, so it is not
+	// reallocated per window. Rebuilt only when the screen size changes, which
+	// it can: see SANDBOX_RESOLUTION.
+	if (!ghTempBitmap || gTempBitmapWidth != capX || gTempBitmapHeight != capY)
 	{
-		// Create a single temp bitmap for all windows to draw on it
-		// (avoids allocating a bitmap every time)
+		if (ghTempBitmap)
+		{
+			DeleteObject(ghTempBitmap);
+		}
+
 		ghTempBitmap = CreateCompatibleBitmap(hdcSource, capX, capY);
+		gTempBitmapWidth = capX;
+		gTempBitmapHeight = capY;
 	}
 
 	// The full-screen target, reused across frames. See gTargetBitmap.

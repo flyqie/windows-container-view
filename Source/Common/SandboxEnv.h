@@ -14,3 +14,12 @@ const wchar_t* SandboxPort();
 
 // Host to connect to. SANDBOX_HOST; the client needs it, the server ignores it.
 const wchar_t* SandboxHost();
+
+// Requested display mode, from SANDBOX_RESOLUTION as "WIDTHxHEIGHT". Returns
+// false when it is unset or malformed, in which case the container's default
+// mode is left alone.
+//
+// The container has no display adapter, so win32k falls back to a stub driver
+// that advertises a fixed set of 18 modes. A value outside that set is rejected
+// and logged; see Docs/IMAGE-ANALYSIS.md.
+bool SandboxResolution(int& Width, int& Height);

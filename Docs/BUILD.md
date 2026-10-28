@@ -195,14 +195,16 @@ it:
 
 ---
 
-## 5. Port and address
+## 5. Configuration
 
-Both are **environment variables**. Unset means the default.
+Everything is an **environment variable**. Unset means the default.
 
 | Variable | Default | Read by | Meaning |
 |---|---|---|---|
 | `SANDBOX_PORT` | `5001` | both | RPC endpoint |
 | `SANDBOX_HOST` | none | client | Server address; required |
+| `SANDBOX_RESOLUTION` | none | client | Container desktop size, `WIDTHxHEIGHT` |
+| `SANDBOX_FPS` | `30` | client | Capture rate, 1–240 |
 | `SANDBOX_DEBUG` | none | both | Set to `1` to print anything |
 
 The default port is in `Source/Interface/SandboxConfig.h`:
@@ -210,6 +212,34 @@ The default port is in `Source/Interface/SandboxConfig.h`:
 ```c
 #define SANDBOX_RPC_ENDPOINT L"5001"
 ```
+
+### SANDBOX_RESOLUTION
+
+The container has no display adapter. win32k falls back to a stub display driver
+built into itself, which advertises a fixed set of modes; the client asks for one
+of them before starting the program, so it opens at the right size.
+
+```
+-e SANDBOX_RESOLUTION=1920x1080
+```
+
+Only these are accepted, all at 32bpp and 60 Hz:
+
+```
+1024x768   640x480    800x600    1152x864   1280x768   1280x800
+1280x1024  1440x900   1600x1200  1680x1050  1856x1392  1920x1200
+2560x1600  1600x768   1600x900   1920x1080  1024x600   1366x768
+```
+
+Anything else is refused by the driver, and the default — 1024x768 — is used
+instead. With `SANDBOX_DEBUG=1` the client says which happened. See
+[IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md), section 4.
+
+### SANDBOX_FPS
+
+The capture cost is roughly fixed per frame, so this trades container CPU for
+smoothness: 30 fps is about 30% of one core, 15 fps about half that. See
+[PERFORMANCE.md](PERFORMANCE.md).
 
 **Both sides must use the same port.** They each read `SANDBOX_PORT` from their
 own environment, so either set it on both or on neither.

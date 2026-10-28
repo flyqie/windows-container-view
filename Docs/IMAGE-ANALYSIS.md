@@ -188,9 +188,13 @@ if (dmPelsWidth == 0 && dmPelsHeight == 0 && dmBitsPerPel == 0 && dmDisplayFrequ
 
 **So `ChangeDisplaySettings` with one of those 18 modes — 32bpp and 60 Hz are
 required for the match — should work.** `NtUserChangeDisplaySettings` contains
-only a UIPI/integrity check and no silo or container gate. The commented-out
-`ChangeDisplaySettings` block that used to sit in `Client.cpp` is worth retrying;
-it was removed from the code and is recorded here instead. **Not yet tested.**
+only a UIPI/integrity check and no silo or container gate.
+
+The client does this before starting the program, driven by `SANDBOX_RESOLUTION`
+(see [BUILD.md](BUILD.md), section 5). Note that the bit depth and refresh rate
+have to be set as well as the size: the stub driver looks the mode up in its table
+with all three attached, and silently falls back to the default when any is
+missing.
 
 ---
 
@@ -272,5 +276,5 @@ would take.
 | Where is the headroom? | Not in dirty rectangles, as it turned out. See [PERFORMANCE.md](PERFORMANCE.md) |
 | Could the whole approach be replaced? | **No.** The RDP server stack is complete and `TemporaryALiC` lifts the first barrier, but the protocol stack depends on UMBus and PnP enumeration, which a process-isolated container cannot provide. See [RDP-IN-CONTAINER.md](RDP-IN-CONTAINER.md) |
 | Audio? | None at all, and not even through RDP redirection. See [AUDIO.md](AUDIO.md) |
-| Can the resolution be changed? | **Probably.** The container's display is win32k's `StubDisp`, which advertises 18 modes and accepts `ChangeDisplaySettings` among them. Not yet tested |
+| Can the resolution be changed? | **Yes, within limits.** The container's display is win32k's `StubDisp`, which advertises 18 modes; `SANDBOX_RESOLUTION` picks one. Sizes outside the list are refused |
 | The biggest lesson? | **"An empty event log" does not mean "the code did not run."** With diagnostics off by default, everything looks fine |
