@@ -1,3 +1,5 @@
+#include <Windows.h>
+
 #include "Event.h"
 #include "../Interface/sandbox_h.h"
 
@@ -34,6 +36,36 @@ void EventManager::EmitKeyboardEvent(int keyIndex, bool bKeyDown)
 	event.keyboardEvent.bKeyDown = bKeyDown;
 	event.keyboardEvent.keyIndex = keyIndex;
 	std::lock_guard<std::mutex> lock(m_mutex);
+	m_eventQueue.push(event);
+}
+
+void EventManager::EmitWheelEvent(float Delta, float HDelta, int x, int y)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+
+	// SDL reports the scroll as a float. A mouse's wheel gives whole notches,
+	// but a precision touchpad gives a stream of fractions that would each
+	// truncate to zero on their own, so the remainder is kept until it adds up.
+	m_wheelAccumulator += Delta;
+	m_hwheelAccumulator += HDelta;
+
+	const int Steps = (int)m_wheelAccumulator;
+	const int HSteps = (int)m_hwheelAccumulator;
+
+	if (!Steps && !HSteps)
+	{
+		return;
+	}
+
+	m_wheelAccumulator -= (float)Steps;
+	m_hwheelAccumulator -= (float)HSteps;
+
+	SandboxEvent event;
+	event.eventType = SBET_WheelEvent;
+	event.wheelEvent.delta = Steps * WHEEL_DELTA;
+	event.wheelEvent.hdelta = HSteps * WHEEL_DELTA;
+	event.wheelEvent.x = x;
+	event.wheelEvent.y = y;
 	m_eventQueue.push(event);
 }
 

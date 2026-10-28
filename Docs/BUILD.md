@@ -341,6 +341,24 @@ and so on). The client has to strip that marker and set `KEYEVENTF_EXTENDEDKEY`
 before injecting, or `SendInput` does not recognise the scan code and discards it.
 The handling is in the `SBET_KeyEvent` branch of `Client.cpp`.
 
+### The mouse wheel does nothing
+
+Three things have to line up, and only the first is likely:
+
+1. **The host window needs mouse focus.** Windows delivers `WM_MOUSEWHEEL` to
+   the focused window, and SDL's Windows backend drops the event outright when
+   the pointer is not over its window. Move the pointer onto the host window.
+2. **The scroll arrives with the frame**, not on its own, so it is applied at
+   `SANDBOX_FPS`. A burst of scrolling arrives in one batch per frame — nothing
+   is lost, it arrives chunky. This is true of the pointer and the keyboard too.
+3. **Only whole notches cross.** A precision touchpad reports fractions, which
+   are accumulated on the host until they make up one notch, so a very slow
+   two-finger drag takes a moment to register. A mouse's wheel is unaffected.
+
+If it is still dead, set `SANDBOX_DEBUG=1` on the client: `SendInput for wheel
+returned false` means the injection itself was refused, which is a different
+problem from the event never arriving.
+
 ### The status bar flickers, or dialog buttons do
 
 There is **no DWM in the container** (`tasklist /fi "imagename eq dwm.exe"`

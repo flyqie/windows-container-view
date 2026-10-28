@@ -604,6 +604,22 @@ void InitVideo()
 			case SDL_MOUSEBUTTONUP:
 				gEventManager.EmitMouseKeyEvent(SDLButtonToWinButton(event.button.button), (int)(event.button.x * WidthRatio), (int)(event.button.y * HeightRatio), false);
 				break;
+			case SDL_MOUSEWHEEL:
+				// SDL reports the amount in notches, and has already applied the
+				// system's scrolling direction to it -- the direction field is
+				// informational. Its sign matches the container's: positive is
+				// away from the user, and to the right horizontally.
+				//
+				// preciseX/preciseY rather than x/y, because a precision
+				// touchpad's fractions truncate to zero in the integer fields.
+				// The position is the one SDL had when the scroll arrived, in
+				// window pixels, so it scales like any other mouse coordinate.
+				gEventManager.EmitWheelEvent(
+					event.wheel.preciseY,
+					event.wheel.preciseX,
+					(int)(event.wheel.mouseX * WidthRatio),
+					(int)(event.wheel.mouseY * HeightRatio));
+				break;
 			case SDL_KEYDOWN:
 				gEventManager.EmitKeyboardEvent(SDLKeyToWinKey(event.key.keysym.scancode), true);
 				break;

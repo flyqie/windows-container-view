@@ -65,7 +65,8 @@ extern "C"{
 enum SandboxEventType
     {
         SBET_KeyEvent	= 0,
-        SBET_MouseEvent	= ( SBET_KeyEvent + 1 ) 
+        SBET_MouseEvent	= ( SBET_KeyEvent + 1 ) ,
+        SBET_WheelEvent	= ( SBET_MouseEvent + 1 ) 
     } ;
 struct SandboxMouseEvent
     {
@@ -79,6 +80,13 @@ struct SandboxKeyboardEvent
     int keyIndex;
     int bKeyDown;
     } ;
+struct SandboxWheelEvent
+    {
+    int delta;
+    int hdelta;
+    int x;
+    int y;
+    } ;
 struct SandboxEvent
     {
     int eventType;
@@ -86,6 +94,7 @@ struct SandboxEvent
         {
         /* [case()] */ struct SandboxKeyboardEvent keyboardEvent;
         /* [case()] */ struct SandboxMouseEvent mouseEvent;
+        /* [case()] */ struct SandboxWheelEvent wheelEvent;
         /* [default] */  /* Empty union arm */ 
         } 	;
     } ;

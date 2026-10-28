@@ -142,6 +142,9 @@ it dirty every time the mouse moves.
   read the picture and inject input. Suitable for a trusted network only.
 * **One session at a time.** The server's state — texture, cursor, event queue —
   is global.
+* **Input is applied at the frame rate.** The pointer, the wheel and the keyboard
+  all travel back with the frame, so they take effect at `SANDBOX_FPS` rather than
+  the moment they happen.
 * **Themes draw imperfectly.** With no DWM in the container, `WM_PRINT` does not
   fully support themed controls. Status bars are handled by re-printing each
   descendant; dialog buttons still flicker on a fraction of frames.

@@ -435,6 +435,43 @@ static void ApplyInputEvent(const SandboxEvent& event)
 		}
 		break;
 
+	case SBET_WheelEvent:
+	{
+		// The system delivers the wheel to the window with keyboard focus, but
+		// the message carries the cursor position, so the cursor has to be where
+		// the user was pointing.
+		SetCursorPos(event.wheelEvent.x, event.wheelEvent.y);
+
+		INPUT input = { 0 };
+		input.type = INPUT_MOUSE;
+
+		// One notch is WHEEL_DELTA, and the sign carries over from the host:
+		// positive is away from the user vertically, to the right horizontally.
+		// mouseData is a DWORD holding a signed delta, so the cast is intended.
+		if (event.wheelEvent.delta)
+		{
+			input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+			input.mi.mouseData = (DWORD)event.wheelEvent.delta;
+
+			if (!SendInput(1, &input, sizeof(INPUT)))
+			{
+				Debug() << "SendInput for wheel returned false with error " << hex << GetLastError() << endl;
+			}
+		}
+
+		if (event.wheelEvent.hdelta)
+		{
+			input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
+			input.mi.mouseData = (DWORD)event.wheelEvent.hdelta;
+
+			if (!SendInput(1, &input, sizeof(INPUT)))
+			{
+				Debug() << "SendInput for horizontal wheel returned false with error " << hex << GetLastError() << endl;
+			}
+		}
+	}
+		break;
+
 	case SBET_KeyEvent:
 	{
 		WORD scan = (WORD)event.keyboardEvent.keyIndex;
