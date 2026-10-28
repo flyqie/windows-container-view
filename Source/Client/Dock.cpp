@@ -1,19 +1,38 @@
+#include "Dock.h"
+
 #include <Windows.h>
 
 #include <algorithm>
+#include <iostream>
 #include <vector>
 
 #include "../Common/SandboxEnv.h"
-#include "Dock.h"
+#include "../Common/SandboxLog.h"
+
+using namespace std;
 
 namespace
 {
+	// Whether the dock was asked for. Read once; the environment cannot change
+	// under a running process, and this is asked for on every frame.
+	bool Enabled()
+	{
+		static const bool On = SandboxDock();
+
+		return On;
+	}
+
+	int Height()
+	{
+		return Enabled() ? SANDBOX_DOCK_HEIGHT : 0;
+	}
+
 	// One button per window, in the order the windows first appeared.
 	//
-	// Deliberately not z-order: that changes every time the user clicks a
-	// window, and buttons that reshuffle under the cursor cannot be clicked.
-	// A window is appended when it shows up and dropped when it goes away, which
-	// is what a taskbar does.
+	// Deliberately not z-order: that changes every time the user clicks a window,
+	// and buttons that reshuffle under the cursor cannot be clicked. A window is
+	// appended when it shows up and dropped when it goes away, which is what a
+	// taskbar does.
 	std::vector<HWND> gButtons;
 
 	const int ButtonWidth = 150;
@@ -49,8 +68,8 @@ namespace
 		return TRUE;
 	}
 
-	// Brings the button list up to date: drops windows that are gone, appends
-	// the ones that appeared, and leaves everything else where it was.
+	// Brings the button list up to date: drops windows that are gone, appends the
+	// ones that appeared, and leaves everything else where it was.
 	void Refresh()
 	{
 		std::vector<HWND> Found;
@@ -96,8 +115,8 @@ namespace
 		// Windows only lets the process that owns the foreground hand it to
 		// another, and inside the container that is the program being viewed,
 		// never this one. Attaching this thread to the foreground thread's input
-		// queue makes it count as part of that thread, which is the classic
-		// shell workaround for the same restriction.
+		// queue makes it count as part of that thread, which is the classic shell
+		// workaround for the same restriction.
 		const HWND Foreground = GetForegroundWindow();
 		const DWORD ForegroundThread = Foreground ? GetWindowThreadProcessId(Foreground, NULL) : 0;
 		const DWORD ThisThread = GetCurrentThreadId();
@@ -115,29 +134,73 @@ namespace
 	{
 		return ButtonGap + Index * (ButtonWidth + ButtonGap);
 	}
-}
 
-bool DockEnabled()
-{
-	return SandboxDock();
-}
-
-int DockHeight()
-{
-	return DockEnabled() ? SANDBOX_DOCK_HEIGHT : 0;
-}
-
-int DrawDock(HDC hdc, int Left, int Top, int Width)
-{
-	if (!DockEnabled())
+	// Narrows the desktop's work area to leave the bottom Rows to the dock, the
+	// way a taskbar reserves the space it occupies: maximized windows, and
+	// anything else that asks how much room it has, then stop above that line.
+	//
+	// The screen itself is not affected. This changes what programs are told they
+	// can use, not what the display is.
+	void ReserveScreenBottom(int Rows)
 	{
-		return 0;
+		RECT Area = { 0 };
+		Area.right = GetSystemMetrics(SM_CXSCREEN);
+		Area.bottom = GetSystemMetrics(SM_CYSCREEN) - Rows;
+
+		// No SPIF_SENDCHANGE: this runs before the program is started, so there
+		// is nothing yet that has cached the old work area, and the setting
+		// persists for whatever starts later.
+		if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &Area, 0))
+		{
+			Debug() << "Work area could not be reserved (err 0x" << hex << GetLastError() << ")" << endl;
+
+			return;
+		}
+
+		// Read it back rather than trusting the return value. This is the one part
+		// of the dock the container cannot show us, and a work area that quietly
+		// stayed full-screen would leave every maximized window behind it.
+		RECT Got = { 0 };
+
+		if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &Got, 0)
+			&& (Got.right != Area.right || Got.bottom != Area.bottom))
+		{
+			Debug() << "Work area stayed " << Got.right << "x" << Got.bottom
+			        << " rather than " << Area.right << "x" << Area.bottom << endl;
+
+			return;
+		}
+
+		Debug() << "Work area reserved: bottom " << Rows << " rows" << endl;
+	}
+}
+
+void Dock::Open()
+{
+	if (!Enabled())
+	{
+		return;
+	}
+
+	ReserveScreenBottom(SANDBOX_DOCK_HEIGHT);
+}
+
+bool Dock::Contains(int Y, int FrameHeight)
+{
+	return Enabled() && Y >= FrameHeight - SANDBOX_DOCK_HEIGHT;
+}
+
+void Dock::Draw(HDC Dc, int Width, int Height)
+{
+	if (!Enabled())
+	{
+		return;
 	}
 
 	Refresh();
 
-	// Created once. Three GDI objects per frame, thirty times a second, is
-	// churn for no reason.
+	// Created once. Three GDI objects per frame, thirty times a second, is churn
+	// for no reason.
 	static HBRUSH Background = CreateSolidBrush(RGB(32, 32, 32));
 	static HBRUSH Edge = CreateSolidBrush(RGB(70, 70, 70));
 	static HBRUSH Button = CreateSolidBrush(RGB(58, 58, 58));
@@ -146,21 +209,20 @@ int DrawDock(HDC hdc, int Left, int Top, int Width)
 	static HFONT Font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
 	POINT OldOrigin;
-	SetViewportOrgEx(hdc, Left, Top, &OldOrigin);
+	SetViewportOrgEx(Dc, 0, Height - SANDBOX_DOCK_HEIGHT, &OldOrigin);
 
 	RECT Strip{ 0, 0, Width, SANDBOX_DOCK_HEIGHT };
-	FillRect(hdc, &Strip, Background);
+	FillRect(Dc, &Strip, Background);
 
 	// A line along the top, so the dock reads as chrome rather than as part of
 	// whatever window is behind it.
 	RECT Line{ 0, 0, Width, 1 };
-	FillRect(hdc, &Line, Edge);
+	FillRect(Dc, &Line, Edge);
 
-	HGDIOBJ OldFont = SelectObject(hdc, Font);
-	SetBkMode(hdc, TRANSPARENT);
+	HGDIOBJ OldFont = SelectObject(Dc, Font);
+	SetBkMode(Dc, TRANSPARENT);
 
 	const HWND Foreground = GetForegroundWindow();
-	int Drawn = 0;
 
 	for (size_t i = 0; i < gButtons.size(); ++i)
 	{
@@ -182,47 +244,48 @@ int DrawDock(HDC hdc, int Left, int Top, int Width)
 		const bool bActive = !bMinimized && hwnd == Foreground;
 
 		RECT Cell{ x, 2, x + ButtonWidth, SANDBOX_DOCK_HEIGHT - 2 };
-		FillRect(hdc, &Cell, bActive ? Active : (bMinimized ? Minimized : Button));
+		FillRect(Dc, &Cell, bActive ? Active : (bMinimized ? Minimized : Button));
 
 		WCHAR Title[128] = { 0 };
 		GetWindowTextW(hwnd, Title, 128);
 
-		SetTextColor(hdc, bActive ? RGB(255, 255, 255)
+		SetTextColor(Dc, bActive ? RGB(255, 255, 255)
 			: (bMinimized ? RGB(150, 150, 150) : RGB(225, 225, 225)));
 
 		RECT Text = Cell;
 		Text.left += 6;
 		Text.right -= 6;
 
-		// DT_NOPREFIX: an & in a window title is a literal character here, not
-		// an accelerator to underline.
-		DrawTextW(hdc, Title, -1, &Text,
+		// DT_NOPREFIX: an & in a window title is a literal character here, not an
+		// accelerator to underline.
+		DrawTextW(Dc, Title, -1, &Text,
 			DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-		++Drawn;
 	}
 
-	SelectObject(hdc, OldFont);
-	SetViewportOrgEx(hdc, OldOrigin.x, OldOrigin.y, NULL);
-
-	return Drawn;
+	SelectObject(Dc, OldFont);
+	SetViewportOrgEx(Dc, OldOrigin.x, OldOrigin.y, NULL);
 }
 
-bool DockClick(int X, int Y, int Width)
+void Dock::Press(int X, int Y, int Width, int FrameHeight)
 {
+	if (!Contains(Y, FrameHeight))
+	{
+		return;
+	}
+
 	Refresh();
 
 	const int Pitch = ButtonWidth + ButtonGap;
 
 	if (X < ButtonGap || X >= Width)
 	{
-		return false;
+		return;
 	}
 
 	// A click in the gap between two buttons belongs to neither of them.
 	if ((X - ButtonGap) % Pitch >= ButtonWidth)
 	{
-		return false;
+		return;
 	}
 
 	const int Index = (X - ButtonGap) / Pitch;
@@ -231,14 +294,14 @@ bool DockClick(int X, int Y, int Width)
 	// have clicked on.
 	if (Index < 0 || (size_t)Index >= gButtons.size())
 	{
-		return false;
+		return;
 	}
 
 	const HWND Target = gButtons[Index];
 
 	if (!IsWindow(Target))
 	{
-		return false;
+		return;
 	}
 
 	if (IsIconic(Target))
@@ -247,14 +310,12 @@ bool DockClick(int X, int Y, int Width)
 	}
 	else if (Target == GetForegroundWindow())
 	{
-		// The toggle a taskbar button has. It is also the only way to minimize
-		// a window whose title bar is off-screen.
+		// The toggle a taskbar button has. It is also the only way to minimize a
+		// window whose title bar is off-screen.
 		ShowWindow(Target, SW_MINIMIZE);
 	}
 	else
 	{
 		ActivateWindow(Target);
 	}
-
-	return true;
 }

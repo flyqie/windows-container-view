@@ -79,6 +79,25 @@ of the whole output directory.
 > container. Two executables shrink the container-side deployment from a
 > directory to one file and remove the delay-load workaround.
 
+### The client's three parts
+
+`Source/Client/` is divided by what each part is, not by what it happens to touch.
+The boundary is the point: each part could be reasoned about, or replaced, without
+the other two.
+
+| Part | Files | What it is |
+|---|---|---|
+| **Desktop** | `Desktop.h`, `Desktop.cpp`, `DesktopCapture.cpp` | The container's graphical environment: window station, screen, cursor, and the input that goes into it. The equivalent of an X server and a window manager, and it would all still make sense with nothing attached to it |
+| **Dock** | `Dock.h`, `Dock.cpp` | The strip of window buttons along the bottom, because a container has no shell to restore a minimized window from. Optional, and the option is contained in the part: with `SANDBOX_DOCK` unset every entry point does nothing |
+| **Remote** | `Remote.h`, `Remote.cpp`, `FrameProfile.*` | The link to the host — the x11vnc half. The only part that knows about RPC, PNG, or that a host exists |
+
+`main.cpp` brings them up in order: the desktop, then the dock on top of it, then
+the program to run, and only then the session with the host. The desktop is not
+told the dock exists, and neither is told about the host.
+
+`Source/Common/` holds what both executables share: environment variables and the
+`Debug()` stream.
+
 ---
 
 ## 4. Running
@@ -192,7 +211,11 @@ it:
 |---|---|
 | No output, process keeps running | Normal |
 | No output, exit code 2 | The client was not given `SANDBOX_HOST` |
-| No output, exit code 1 | Initialisation failed (RPC registration or binding); set `SANDBOX_DEBUG` to see why |
+| No output, exit code 1 | Initialisation failed (the window station could not be reached, or the RPC binding); set `SANDBOX_DEBUG` to see why |
+| Exits on its own, exit code 0 | The program it started has closed. The desktop has to stay empty for two seconds first, because a window exists before it is shown and one empty look at it is not proof that anything is gone |
+
+The client does not outlive the program it launches: close that program's last
+window and the session ends.
 
 ### 4.5 The dock
 
@@ -397,7 +420,7 @@ The host's SDL-to-DIK table (`scanCodeToKeyNum` in `Rendering.cpp`) sets the hig
 bit on **extended keys** (`DIK_LEFT = 0xCB`, `DIK_UP = 0xC8`, `DIK_DELETE = 0xD3`
 and so on). The client has to strip that marker and set `KEYEVENTF_EXTENDEDKEY`
 before injecting, or `SendInput` does not recognise the scan code and discards it.
-The handling is in the `SBET_KeyEvent` branch of `Client.cpp`.
+The handling is in `Desktop::Key`, in `Source/Client/Desktop.cpp`.
 
 ### The mouse wheel does nothing
 
@@ -439,7 +462,7 @@ context's corner. A scratch bitmap the size of the screen therefore clips the fa
 edge away **before the copy out**, and no amount of adjusting the `BitBlt`
 afterwards can recover it — the columns were never painted.
 
-`printwnd.cpp` allocates the scratch at the screen size plus twice
+`DesktopCapture.cpp` allocates the scratch at the screen size plus twice
 `SM_CXSIZEFRAME + SM_CXPADDEDBORDER`, clamps the destination to the screen, and
 offsets the source by the same amount. The descendants are still positioned
 against the **unclamped** rect origin, because their coordinates are relative to
@@ -449,19 +472,35 @@ it.
 > the work area is the whole screen, so a maximized rect's bottom runs past it
 > and the last rows are lost too. The dock covers them.
 
+### Every window has a thick border around it
+
+The border is real, and it cannot be removed.
+
+Windows gives every resizable window an invisible resize border,
+`SM_CXSIZEFRAME + SM_CXPADDEDBORDER` — 8 px at 100% DPI. On a normal desktop that
+is the grab area, and DWM draws a hairline frame on top of it, so it is never
+seen. **There is no DWM in the container**, and `PrintWindow`'s `PRF_NONCLIENT`
+pass goes through the classic, non-composited non-client painting, which does not
+know that and fills all 8 px in as a visible frame.
+
+The alternatives are worse. `PW_CLIENTONLY` skips the non-client area entirely,
+which takes the title bar with it — nothing left to drag a window by, and no close
+button. Drawing the frame and title bar by hand means reimplementing themed
+controls, which this container already cannot paint reliably.
+
 ### The status bar flickers, or dialog buttons do
 
 There is **no DWM in the container** (`tasklist /fi "imagename eq dwm.exe"`
 returns nothing), so there is no compositor and no screen surface to read.
-`BitBlt` from a window DC produces nothing usable — the original author's comment
-in `printwnd.cpp` records the same finding — and **`WM_PRINT` is the only way to
-get pixels**.
+`BitBlt` from a window DC produces nothing usable, and **`WM_PRINT` is the only
+way to get pixels** — which is why the whole capture is built on it and on
+nothing else (`Source/Client/DesktopCapture.cpp`).
 
 `PrintWindow`'s `PRF_CHILDREN` pass is unreliable for themed common controls:
 
 | Control | Symptom | Status |
 |---|---|---|
-| Status bar `msctls_statusbar32` | Background only; parts and text missing | Fixed: `PrintWindowTree()` in `printwnd.cpp` re-prints every descendant explicitly |
+| Status bar `msctls_statusbar32` | Background only; parts and text missing | Fixed: `PrintWindowTree()` in `DesktopCapture.cpp` re-prints every descendant explicitly |
 | Dialog buttons `Button` | Intermittently blank or missing their text, on about 12% of frames | **Unresolved**; a limitation of `WM_PRINT` with no DWM |
 
 To tell whether a given control is affected, capture a run of frames and diff
@@ -521,8 +560,8 @@ manager.
 ### The frame profile
 
 With `SANDBOX_DEBUG=1`, the client prints once a second. A frame is split into
-`capture`, `encode` and `send`; `capture` is split into `alloc`, `fills`,
-`windows`, `dock` and `toGdi+`; `windows` is split into `toplevel` and `child`
+`capture`, `dock`, `cursor`, `encode` and `send`; `capture` is split into `alloc`,
+`fills`, `windows` and `toGdi+`; `windows` is split into `toplevel` and `child`
 with per-call costs. The last two lines give the capacity answer directly.
 
 What the parts mean, the measured numbers, and the A/B experiments behind the
@@ -557,9 +596,9 @@ wrong answer:
 
 ### Debugging key injection
 
-A `cout << "scan:..."` line used to sit in the `SBET_KeyEvent` branch and was
-removed once the values had been checked. To bring it back temporarily, add it to
-the `SBET_KeyEvent` branch of `ApplyInputEvent`:
+A `cout << "scan:..."` line used to sit in the key branch and was removed once the
+values had been checked. To bring it back temporarily, add it to `Desktop::Key`,
+in `Source/Client/Desktop.cpp`:
 
 | Key | Log |
 |---|---|
@@ -581,7 +620,7 @@ the `SBET_KeyEvent` branch of `ApplyInputEvent`:
 - **One session.** The server's state — texture, cursor, event queue — is global,
   so it serves one container at a time. Serving several means moving that state
   into a per-session structure.
-- **Frame rate.** `FrameIntervalMs` in `Client.cpp` is 33 ms (~30 fps), paced by a
+- **Frame rate.** `FrameIntervalMs` in `Remote.cpp` is 33 ms (~30 fps), paced by a
   high-resolution waitable timer. Measured frame time is 35–39 ms; the remainder
   is scheduling latency in the VM.
 - **Capacity: about 3 containers per core on an idle desktop, about 1 with a

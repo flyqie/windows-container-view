@@ -1,7 +1,7 @@
 # Performance: where a frame's time goes
 
 Measured inside a process-isolated container, with the frame profiler built into
-`Sandbox-Client.exe` (`Source/Client/Client.cpp`). Not estimates — set
+`Sandbox-Client.exe` (`Source/Client/Remote.cpp`). Not estimates — set
 `SANDBOX_DEBUG=1` and it prints a breakdown once a second.
 
 Architecture is in `README.adoc`; building and running in [BUILD.md](BUILD.md);
@@ -13,7 +13,7 @@ what is actually in the container image in [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md
 
 | Phase | Contents |
 |---|---|
-| `capture` | `PrintScreen()`: the full-screen bitmap, the desktop fill, `PrintWindow` over every window, the dock, the conversion to GDI+ |
+| `capture` | `Desktop::Capture()` and `Desktop::Finish()`: the full-screen bitmap, the desktop fill, `PrintWindow` over every window, the conversion to GDI+ |
 | `encode` | GDI+ encoding the whole screen as PNG |
 | `send` | The `RpcSendFrame` round trip (**including the server's decode and texture upload**; see section 5) |
 
@@ -24,12 +24,22 @@ what is actually in the container image in [IMAGE-ANALYSIS.md](IMAGE-ANALYSIS.md
 | `alloc` | `CreateCompatibleBitmap` for the full-screen target |
 | `fills` | `FillRect` to the desktop colour |
 | `windows` | `EnumDesktopWindows` plus every `PrintWindow` and `BitBlt` |
-| `dock` | Drawing the strip of window buttons over the bottom of the desktop |
-| `toGdi+` | `Bitmap::FromHBITMAP` |
+| `toGdi+` | The alpha pass and the wrap into a GDI+ bitmap |
 
-`dock` is newer than the measurements in section 2, which were taken before it
-existed, and it is only there when the client is run with `SANDBOX_DOCK=1`. It
-does not scale with the screen or with the number of controls on it.
+`windows` is split again into `toplevel` (the `PrintWindow` on each top-level
+window) and `child` (the `PrintWindowTree` re-print of descendants), each reported
+with a per-call cost.
+
+**The dock and the cursor are reported on their own lines**, not inside `capture`:
+the dock is drawn onto the frame by `Dock::Draw` between the capture and the
+finish, and the cursor is a separate query against the desktop. Neither is a
+capture cost, and the capture is not told about either.
+
+### The dock
+
+Newer than the measurements in section 2, which were taken before it existed, and
+only there at all when the client is run with `SANDBOX_DOCK=1`. It does not scale
+with the screen or with the number of controls on it.
 
 Measured over 21 runs on an idle `cmd` console, on a 1024x768 desktop:
 
@@ -43,14 +53,11 @@ About 0.8% of a 33 ms budget, or 3% of an idle frame — the same order as `fill
 an order below `windows`. It is a **per-frame** cost, so it scales with the frame
 rate: 1.6% of a core at 60 fps.
 
-The enumeration is the suspected bulk of it, and `PrintScreen` already enumerates
-the desktop's top-level windows a few lines earlier, so passing that list to
-`DrawDock` would remove it. Not done: at 0.8% of a budget, for an opt-in switch,
-it is not worth the extra parameter.
-
-`windows` is split again into `toplevel` (the `PrintWindow` on each top-level
-window) and `child` (the `PrintWindowTree` re-print of descendants), each reported
-with a per-call cost.
+The enumeration in `Refresh` is the suspected bulk of it. `Desktop::Capture`
+enumerates the desktop's top-level windows anyway, a few lines earlier, so handing
+that list across to `Dock::Draw` would remove it — but that would put a desktop
+detail into the dock's interface for 0.8% of a budget, on an opt-in switch, and it
+has not been worth it.
 
 ---
 
@@ -306,7 +313,7 @@ while `alloc` (351 vs 362) and `fills` (4 vs 4) were identical, which rules out 
 global effect.
 
 **The explanation is CPU frequency scaling.** A later run made it obvious: the
-same `ReadCursor` code measured **41–64 us when the loop was mostly idle and 13 us
+same `Desktop::ReadCursor` code measured **41–64 us when the loop was mostly idle and 13 us
 when it was busy**. An idle loop lets the CPU downclock, so the few operations
 that do run are slower each; `alloc` and `fills` are dominated by fixed GDI costs
 rather than CPU-bound loops, which is why they did not move.

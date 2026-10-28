@@ -3,7 +3,9 @@
 
 #include <string>
 
-#include "Client.h"
+#include "Desktop.h"
+#include "Dock.h"
+#include "Remote.h"
 #include "../Common/SandboxEnv.h"
 #include "../Common/SandboxLog.h"
 
@@ -16,6 +18,11 @@
 // and the port from SANDBOX_PORT. Neither is a command-line argument, because
 // the command line belongs to the program being launched -- this is a launcher,
 // and what it launches is the only thing worth varying per deployment.
+//
+// Three parts, brought up in order. The desktop first, then whatever belongs on
+// top of it, then the program -- which starts last so that it opens at the right
+// size and knows how much room it has. Only then does anything talk to the host.
+// See Desktop.h, Dock.h and Remote.h.
 
 namespace
 {
@@ -82,14 +89,20 @@ int main(int argc, char* argv[])
 		return 2;
 	}
 
-	try
+	// Nothing below throws: every failure that a caller can act on comes back as
+	// a return value, which is what the exit code is made of.
+	if (!Desktop::Open())
 	{
-		SandboxInitClient(Host, Command.c_str());
+		return 1;
 	}
-	catch (long ErrorCode)
-	{
-		Debug() << "Failed to init client (error " << ErrorCode << ")" << std::endl;
 
+	// Before the program starts, so it is born knowing how much room it has.
+	Dock::Open();
+
+	Desktop::StartProgram(Command.c_str());
+
+	if (!RemoteRun(Host))
+	{
 		return 1;
 	}
 

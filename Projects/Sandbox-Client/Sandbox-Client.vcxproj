@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -90,21 +90,22 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\Source\Client\Client.cpp" />
+    <ClCompile Include="..\..\Source\Client\Desktop.cpp" />
+    <ClCompile Include="..\..\Source\Client\DesktopCapture.cpp" />
     <ClCompile Include="..\..\Source\Client\Dock.cpp" />
-    <ClCompile Include="..\..\Source\Client\Init.cpp" />
+    <ClCompile Include="..\..\Source\Client\FrameProfile.cpp" />
     <ClCompile Include="..\..\Source\Client\main.cpp" />
-    <ClCompile Include="..\..\Source\Client\printwnd.cpp" />
+    <ClCompile Include="..\..\Source\Client\Remote.cpp" />
     <ClCompile Include="..\..\Source\Common\SandboxEnv.cpp" />
     <ClCompile Include="..\..\Source\Common\SandboxLog.cpp" />
     <ClCompile Include="..\..\Source\Interface\midl.cpp" />
     <ClCompile Include="..\..\Source\Interface\sandbox_c.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\Source\Client\Client.h" />
+    <ClInclude Include="..\..\Source\Client\Desktop.h" />
     <ClInclude Include="..\..\Source\Client\Dock.h" />
-    <ClInclude Include="..\..\Source\Client\Init.h" />
-    <ClInclude Include="..\..\Source\Client\printwnd.h" />
+    <ClInclude Include="..\..\Source\Client\FrameProfile.h" />
+    <ClInclude Include="..\..\Source\Client\Remote.h" />
     <ClInclude Include="..\..\Source\Common\SandboxEnv.h" />
     <ClInclude Include="..\..\Source\Common\SandboxLog.h" />
     <ClInclude Include="..\..\Source\Interface\SandboxEvent.h" />

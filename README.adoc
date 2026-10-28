@@ -165,6 +165,9 @@ it dirty every time the mouse moves.
 * **Themes draw imperfectly.** With no DWM in the container, `WM_PRINT` does not
   fully support themed controls. Status bars are handled by re-printing each
   descendant; dialog buttons still flicker on a fraction of frames.
+* **Every window keeps its resize border.** DWM normally hides it. Without DWM,
+  `WM_PRINT` paints all 8 pixels of it as a visible frame, and it cannot be
+  removed without removing the title bars with it.
 * **Capacity.** About 30% of one core per container on an idle desktop, and about
   one core with a dialog open.
 * **No audio.** Containers have no audio endpoint and no stream to capture.

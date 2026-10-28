@@ -50,8 +50,8 @@ or rendering through D3D is a dead end.
 ### Conclusion
 
 **`WM_PRINT` / `PrintWindow` is the only way to get window pixels in the
-container**, with no alternative. The original author's comment in `printwnd.cpp`
-is correct — it is not that other approaches were overlooked.
+container**, with no alternative. It is not that other approaches were
+overlooked; the capture is built on `WM_PRINT` and on nothing else.
 
 ### On `windows/server:ltsc2025` this table mostly reverses
 
@@ -261,7 +261,7 @@ would take.
   `GetSynthesizedContainerMouseInputEvent`, but nothing configurable for a
   container's virtual display size.
 - **Window station**: `CreateWindowStation("WinSta0")`, `CreateDesktop("Default")`,
-  `SetUserObjectInformation(WSF_VISIBLE)` and `SwitchDesktop` in `Init.cpp`. This
+  `SetUserObjectInformation(WSF_VISIBLE)` and `SwitchDesktop` in `Desktop.cpp`. This
   works in the container and is what makes the whole thing possible.
 
 ---
